@@ -26,7 +26,8 @@ class QueueEntry(Base):
             "uq_queue_entries_active_user",
             "queue_id", "user_id",
             unique=True,
-            postgresql_where=text("status IN (1, 2)"),
+            postgresql_where=text("status IN (1, 2)"), # TODO: Change it while changing the DB
+            sqlite_where=text("status IN (1, 2)"), # for running tests # TODO: remove it while test migrate to Postgres
         ),
     )
     id: Mapped[int] = mapped_column(primary_key=True)

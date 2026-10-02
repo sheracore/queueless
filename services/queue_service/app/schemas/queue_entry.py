@@ -35,3 +35,8 @@ class QueueEntryResponse(BaseModel):
     model_config = {
         "from_attributes": True
     }
+
+
+class QueueLeaveRequest(BaseModel):
+    # Temporary: once the Identity Service exists, this comes from the auth token.
+    user_id: int

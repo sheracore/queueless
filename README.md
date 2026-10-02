@@ -45,7 +45,23 @@ queries such as "what is my position?" stay synchronous over HTTP.
 - **Domain:** `Business` 1-N `Queue` 1-N `QueueEntry`
 - **Queue entry states:** `WAITING(1)`, `CALLED(2)`, `SERVED(3)`, `LEFT(4)`, `NO_SHOW(5)`
 - **Concurrency:** ticket numbers and "call next" run under a row lock (`SELECT ... FOR UPDATE`) on the queue row, so simultaneous requests are serialized
-- **Rules enforced in the database:** unique ticket number per queue; one active (WAITING/CALLED) entry per user per queue
+- **State machine:** serve, no-show and leave are atomic compare-and-set updates (`UPDATE ... WHERE status IN (allowed) RETURNING`). If two actions race on one ticket, exactly one wins and the other gets `409`.
+- **Rules enforced in the database:** unique ticket number per queue; one active (WAITING/CALLED) entry per user per queue (a partial unique index, so a user can rejoin after leaving or being served)
+
+### Ticket lifecycle
+
+```
+            call-next             serve
+ WAITING ─────────────> CALLED ─────────> SERVED
+    │                      │
+    │ leave                │ no-show
+    v                      v
+  LEFT                  NO_SHOW
+```
+
+`SERVED`, `LEFT` and `NO_SHOW` are final. Any other move returns `409`, for example `Cannot change entry from WAITING to SERVED`.
+The allowed moves are defined in one place, `ALLOWED_TRANSITIONS` in `app/services/queue_service.py`.
+
 ### API
  
 | Method | Path | Description |
@@ -54,7 +70,12 @@ queries such as "what is my position?" stay synchronous over HTTP.
 | POST | `/businesses` | Create a business |
 | POST | `/businesses/{business_id}/queues` | Create a queue (starts OPEN) |
 | POST | `/queues/{queue_id}/join` | Join a queue; body `{"user_id": 1}` (temporary until auth exists) |
-| POST | `/queues/{queue_id}/call-next` | Call the lowest waiting ticket |
+| POST | `/queues/{queue_id}/call-next` | Call the lowest waiting ticket (`409` if nobody is waiting) |
+| POST | `/queues/{queue_id}/entries/{entry_id}/serve` | CALLED → SERVED (sets `served_at`) |
+| POST | `/queues/{queue_id}/entries/{entry_id}/no-show` | CALLED → NO_SHOW |
+| POST | `/queues/{queue_id}/entries/{entry_id}/leave` | WAITING → LEFT; body `{"user_id": 1}`, only the ticket's owner (otherwise `404`) |
+
+Error conventions: `404` for an unknown business, queue or entry (also for an entry in another queue, or one belonging to another user), and `409` for a business-rule conflict (queue not open, already in the queue, invalid state change).
  
 Interactive docs are served at `/docs` when the app is running.
  
@@ -90,7 +111,23 @@ python -m pytest -q
 ```
  
 Tests run against in-memory SQLite. SQLite ignores row locks, so they verify logic but not concurrency;
-locking behaviour is checked manually against PostgreSQL.
+locking behaviour is checked manually against PostgreSQL. Partial indexes declare both `postgresql_where` and
+`sqlite_where`, so the same rule holds in tests and in production.
+
+| File | Covers |
+| ---- | ------ |
+| `tests/test_queue_flow.py` | join, duplicate join, 404s, call-next order, empty queue, called user can't rejoin |
+| `tests/test_entry_transitions.py` | serve, no-show, leave + rejoin, final states, invalid moves, ownership, cross-queue 404 |
+
+### Manual concurrency checks (PostgreSQL)
+
+```bash
+# Two employees press "call next" at once: expect two different tickets
+curl -s -X POST localhost:8000/queues/1/call-next & curl -s -X POST localhost:8000/queues/1/call-next & wait
+
+# Serve and no-show race on one CALLED ticket: expect one 200 and one 409
+curl -s -X POST localhost:8000/queues/1/entries/1/serve & curl -s -X POST localhost:8000/queues/1/entries/1/no-show & wait
+```
  
 ### Migrations
  
@@ -117,7 +154,8 @@ queueless/
 │       │   ├── database.py
 │       │   └── main.py
 │       ├── migrations/         # Alembic
-│       └── tests/
+│       ├── tests/
+│       └── pytest.ini
 └── README.md
 ```
  
@@ -125,7 +163,8 @@ queueless/
  
 - [x] Requirements and architecture
 - [x] First service: models, migrations, create business/queue, join queue
-- [ ] Call next, serve, no-show, leave (atomic state transitions)
+- [x] Call next (row lock on the queue)
+- [x] Serve, no-show, leave (state machine + atomic compare-and-set)
 - [ ] Dockerize the Queue Service
 - [ ] Kafka: producers, consumers, topics, partitions, consumer groups
 - [ ] Delivery semantics, retries, dead-letter topics, idempotency
@@ -133,4 +172,3 @@ queueless/
 - [ ] Event schemas and versioning
 - [ ] Observability, testing, load testing, security
 - [ ] Kubernetes deployment and production architecture
- 
