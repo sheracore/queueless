@@ -16,5 +16,30 @@ services:
       timeout: 5s
       retries: 5
 
+  queue-migrate:
+    build: ./services/queue_service
+    image: queueless/queue-service:dev
+    command: [ "alembic", "upgrade", "head" ]
+    environment:
+      DATABASE_URL: postgresql+psycopg://queueless:queueless@postgres:5432/queueless
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  queue-service:
+    image: queueless/queue-service:dev
+    container_name: queueless-queue-service
+    environment:
+      DATABASE_URL: postgresql+psycopg://queueless:queueless@postgres:5432/queueless
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      queue-migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
 volumes:
   postgres_data:

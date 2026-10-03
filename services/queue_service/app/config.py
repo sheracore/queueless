@@ -2,7 +2,16 @@ from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-BASE_DIR = Path(__file__).resolve().parents[3]
+
+def find_env_file() -> Path | None:
+    # Local dev: walk up from this file and use the first .env found (the repo root's).
+    # In a container there is no .env (it's excluded by .dockerignore), so this returns None
+    # and settings come purely from real environment variables.
+    for parent in Path(__file__).resolve().parents:
+        candidate = parent / ".env"
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 class Settings(BaseSettings):
@@ -10,7 +19,7 @@ class Settings(BaseSettings):
     database_url: str
 
     model_config = SettingsConfigDict(
-        env_file=BASE_DIR / ".env",
+        env_file=find_env_file(),
         env_file_encoding="utf-8",
     )
 

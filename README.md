@@ -1,18 +1,18 @@
 # QueueLess
- 
+
 Smart virtual and physical queueing for businesses such as clinics, barbers, restaurants and government offices.
 Customers take a ticket (virtually, or by scanning a QR code on site), track their position and estimated wait,
 and get notified when their turn approaches. Businesses create queues, call the next customer, and mark them served or skipped.
- 
+
 QueueLess is also a hands-on learning project: a real product used to learn **microservices, FastAPI and Kafka**
 step by step, one concept at a time.
- 
-> **Status:** early development. Only the Queue Service exists so far; Kafka and the other services come later (see Roadmap).
- 
+
+> **Status:** early development. Only the Queue Service exists so far, and it runs in Docker. Kafka and the other services come later (see Roadmap).
+
 ## Architecture
- 
+
 Target architecture (the destination, not where we are today):
- 
+
 ```
 Customer / Business
         |
@@ -32,16 +32,16 @@ Service   Service      Service
 Notification  Waiting-Time  Analytics
  Service       Service       Service
 ```
- 
+
 Principles: database per service, no shared business logic between services, events represent facts,
 idempotent consumers, and failure is normal. Kafka carries domain events (for example `CustomerJoinedQueue`);
 queries such as "what is my position?" stay synchronous over HTTP.
- 
+
 ## What exists today
- 
+
 `services/queue_service`: a FastAPI service backed by PostgreSQL.
- 
-- **Stack:** FastAPI, SQLAlchemy 2.x, Alembic, Pydantic v2 / pydantic-settings, PostgreSQL 17 (Docker), pytest
+
+- **Stack:** FastAPI, SQLAlchemy 2.x, Alembic, Pydantic v2 / pydantic-settings, PostgreSQL 17, pytest, Docker / Docker Compose
 - **Domain:** `Business` 1-N `Queue` 1-N `QueueEntry`
 - **Queue entry states:** `WAITING(1)`, `CALLED(2)`, `SERVED(3)`, `LEFT(4)`, `NO_SHOW(5)`
 - **Concurrency:** ticket numbers and "call next" run under a row lock (`SELECT ... FOR UPDATE`) on the queue row, so simultaneous requests are serialized
@@ -63,7 +63,7 @@ queries such as "what is my position?" stay synchronous over HTTP.
 The allowed moves are defined in one place, `ALLOWED_TRANSITIONS` in `app/services/queue_service.py`.
 
 ### API
- 
+
 | Method | Path | Description |
 | ------ | ---- | ----------- |
 | GET | `/health` | Health check |
@@ -76,40 +76,81 @@ The allowed moves are defined in one place, `ALLOWED_TRANSITIONS` in `app/servic
 | POST | `/queues/{queue_id}/entries/{entry_id}/leave` | WAITING → LEFT; body `{"user_id": 1}`, only the ticket's owner (otherwise `404`) |
 
 Error conventions: `404` for an unknown business, queue or entry (also for an entry in another queue, or one belonging to another user), and `409` for a business-rule conflict (queue not open, already in the queue, invalid state change).
- 
+
 Interactive docs are served at `/docs` when the app is running.
- 
+
 ## Getting started
- 
-Prerequisites: Python 3.12, Docker.
- 
+
+Prerequisites: Docker. For local development you also need Python 3.12+.
+
+### Option A: run everything in Docker
+
 ```bash
-# 1. Start PostgreSQL (published on host port 5433)
+docker compose up --build
+```
+
+This runs three containers in order:
+
+| Service | What it does |
+| ------- | ------------ |
+| `postgres` | PostgreSQL 17, published on host port **5433** |
+| `queue-migrate` | One-shot job: runs `alembic upgrade head`, then exits |
+| `queue-service` | The API on http://localhost:8000. It starts only after postgres is healthy **and** the migrations have finished successfully |
+
+Open http://localhost:8000/docs. Useful commands:
+
+```bash
+docker compose ps                       # queue-service should show "(healthy)"
+docker compose logs -f queue-service
+docker compose logs queue-migrate       # migration output
+docker compose down                     # stop (keeps the data volume)
+docker compose down -v                  # stop and wipe the database
+```
+
+### Option B: run the service locally (fast reload while coding)
+
+```bash
+# 1. Start only PostgreSQL
 docker compose up -d postgres
- 
+
 # 2. Create a virtualenv and install dependencies
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
- 
+pip install -r services/queue_service/requirements-dev.txt
+
 # 3. Configure the environment: create .env in the repo root
 echo 'DATABASE_URL=postgresql+psycopg://queueless:queueless@localhost:5433/queueless' > .env
- 
+
 # 4. Apply migrations and run the service
 cd services/queue_service
 alembic upgrade head
 uvicorn app.main:app --reload
 ```
- 
-Open http://127.0.0.1:8000/docs.
- 
+
+Don't run options A and B at the same time: both use port 8000.
+
+### Configuration
+
+Settings are read from **environment variables**. `.env` is only a local-development convenience: `config.py` walks up from the
+service directory and loads the first `.env` it finds. The Docker image never contains `.env` (see `.dockerignore`), and Compose
+passes `DATABASE_URL` directly.
+
+| Variable | Local (Option B) | Inside Docker (Option A) |
+| -------- | ---------------- | ------------------------ |
+| `DATABASE_URL` | `...@localhost:5433/queueless` | `...@postgres:5432/queueless` |
+
+Inside the Compose network, containers reach each other by **service name** on the **container** port (`postgres:5432`).
+`localhost:5433` only works from your machine, because `localhost` inside a container means that container itself.
+
 ### Tests
- 
+
 ```bash
 cd services/queue_service
 python -m pytest -q
 ```
- 
+
+Test dependencies (`pytest`, `httpx`) live in `requirements-dev.txt` and are not installed in the Docker image.
+
 Tests run against in-memory SQLite. SQLite ignores row locks, so they verify logic but not concurrency;
 locking behaviour is checked manually against PostgreSQL. Partial indexes declare both `postgresql_where` and
 `sqlite_where`, so the same rule holds in tests and in production.
@@ -128,23 +169,29 @@ curl -s -X POST localhost:8000/queues/1/call-next & curl -s -X POST localhost:80
 # Serve and no-show race on one CALLED ticket: expect one 200 and one 409
 curl -s -X POST localhost:8000/queues/1/entries/1/serve & curl -s -X POST localhost:8000/queues/1/entries/1/no-show & wait
 ```
- 
+
 ### Migrations
- 
+
+In Docker, migrations run automatically through the `queue-migrate` job. Locally:
+
 ```bash
 cd services/queue_service
 alembic revision --autogenerate -m "describe the change"   # always review the generated file
 alembic upgrade head
 ```
- 
+
 ## Project structure
- 
+
 ```
 queueless/
-├── docker-compose.yml
-├── requirements.txt
+├── docker-compose.yml          # postgres + queue-migrate + queue-service
 ├── services/
 │   └── queue_service/
+│       ├── Dockerfile
+│       ├── .dockerignore
+│       ├── requirements.txt        # runtime dependencies (go into the image)
+│       ├── requirements-dev.txt    # + test tools
+│       ├── alembic.ini
 │       ├── app/
 │       │   ├── api/routes/     # HTTP routes
 │       │   ├── models/         # SQLAlchemy models
@@ -158,14 +205,14 @@ queueless/
 │       └── pytest.ini
 └── README.md
 ```
- 
+
 ## Roadmap
- 
+
 - [x] Requirements and architecture
 - [x] First service: models, migrations, create business/queue, join queue
 - [x] Call next (row lock on the queue)
 - [x] Serve, no-show, leave (state machine + atomic compare-and-set)
-- [ ] Dockerize the Queue Service
+- [x] Dockerize the Queue Service (image, migration job, healthcheck)
 - [ ] Kafka: producers, consumers, topics, partitions, consumer groups
 - [ ] Delivery semantics, retries, dead-letter topics, idempotency
 - [ ] Outbox pattern, database per service, sagas
