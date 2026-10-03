@@ -17,6 +17,8 @@ def find_env_file() -> Path | None:
 class Settings(BaseSettings):
     app_name: str = "QueueLess Queue Service"
     database_url: str
+    kafka_bootstrap_servers: str = "localhost:9094"
+    queue_events_topic: str = "queue.events"
 
     model_config = SettingsConfigDict(
         env_file=find_env_file(),

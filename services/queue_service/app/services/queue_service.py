@@ -4,8 +4,11 @@ from fastapi import HTTPException
 from sqlalchemy import update
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.models.queue import Queue, QueueStatus
 from app.models.queue_entry import QueueEntry, QueueEntryStatus
+from app.events.envelope import EventType, entry_event
+from app.events.publisher import EventPublisher
 
 
 # The state machine of a ticket: current status -> statuses it may move to.
@@ -23,7 +26,26 @@ def allowed_sources(target: QueueEntryStatus) -> list[QueueEntryStatus]:
     return [src for src, targets in ALLOWED_TRANSITIONS.items() if target in targets]
 
 
+# Which fact happened when an entry reaches each status.
+TRANSITION_EVENTS: dict[QueueEntryStatus, EventType] = {
+    QueueEntryStatus.SERVED: EventType.CUSTOMER_SERVED,
+    QueueEntryStatus.NO_SHOW: EventType.CUSTOMER_NO_SHOW,
+    QueueEntryStatus.LEFT: EventType.CUSTOMER_LEFT_QUEUE,
+}
+
+
 class QueueService:
+
+    def __init__(self, publisher: EventPublisher):
+        self.publisher = publisher
+
+    def _publish(self, event_type: EventType, entry: QueueEntry) -> None:
+        # Key = queue_id: all events of one queue land in the same partition, in order.
+        self.publisher.publish(
+            topic=settings.queue_events_topic,
+            key=str(entry.queue_id),
+            event=entry_event(event_type, entry),
+        )
 
     def join_queue(
         self,
@@ -83,6 +105,7 @@ class QueueService:
         db.commit() # Queue changes will be commited automatically
         db.refresh(entry)
 
+        self._publish(EventType.CUSTOMER_JOINED_QUEUE, entry)
         return entry
 
     def call_next(
@@ -120,6 +143,8 @@ class QueueService:
 
         db.commit()
         db.refresh(entry)
+
+        self._publish(EventType.CUSTOMER_CALLED, entry)
         return entry
 
     def _transition(
@@ -166,6 +191,8 @@ class QueueService:
 
         db.commit()
         db.refresh(entry)
+
+        self._publish(TRANSITION_EVENTS[target], entry)
         return entry
 
     def serve(self, db: Session, queue_id: int, entry_id: int) -> QueueEntry:

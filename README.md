@@ -7,7 +7,7 @@ and get notified when their turn approaches. Businesses create queues, call the 
 QueueLess is also a hands-on learning project: a real product used to learn **microservices, FastAPI and Kafka**
 step by step, one concept at a time.
 
-> **Status:** early development. Only the Queue Service exists so far, and it runs in Docker. Kafka and the other services come later (see Roadmap).
+> **Status:** early development. The Queue Service runs in Docker and publishes domain events to Kafka. The consuming services come next (see Roadmap).
 
 ## Architecture
 
@@ -41,7 +41,7 @@ queries such as "what is my position?" stay synchronous over HTTP.
 
 `services/queue_service`: a FastAPI service backed by PostgreSQL.
 
-- **Stack:** FastAPI, SQLAlchemy 2.x, Alembic, Pydantic v2 / pydantic-settings, PostgreSQL 17, pytest, Docker / Docker Compose
+- **Stack:** FastAPI, SQLAlchemy 2.x, Alembic, Pydantic v2 / pydantic-settings, PostgreSQL 17, Apache Kafka 4.1 (KRaft) with confluent-kafka, pytest, Docker / Docker Compose
 - **Domain:** `Business` 1-N `Queue` 1-N `QueueEntry`
 - **Queue entry states:** `WAITING(1)`, `CALLED(2)`, `SERVED(3)`, `LEFT(4)`, `NO_SHOW(5)`
 - **Concurrency:** ticket numbers and "call next" run under a row lock (`SELECT ... FOR UPDATE`) on the queue row, so simultaneous requests are serialized
@@ -61,6 +61,39 @@ queries such as "what is my position?" stay synchronous over HTTP.
 
 `SERVED`, `LEFT` and `NO_SHOW` are final. Any other move returns `409`, for example `Cannot change entry from WAITING to SERVED`.
 The allowed moves are defined in one place, `ALLOWED_TRANSITIONS` in `app/services/queue_service.py`.
+
+### Events (Kafka)
+
+Every successful state change publishes one event to the topic **`queue.events`** (3 partitions), **after** the database commit.
+
+| Action | Event type |
+| ------ | ---------- |
+| join | `CustomerJoinedQueue` |
+| call-next | `CustomerCalled` |
+| serve | `CustomerServed` |
+| no-show | `CustomerMarkedNoShow` |
+| leave | `CustomerLeftQueue` |
+
+- **Message key = `queue_id`.** All events of one queue go to the same partition, so consumers see them in order (joined → called → served). Different queues spread across partitions and are processed in parallel.
+- **One topic, many event types.** Kafka orders messages only within a partition, so events that must stay in order relative to each other (the same queue's) share a topic. The type is in the payload and in an `event_type` header.
+- **Envelope** (`app/events/envelope.py`):
+
+```json
+{
+  "event_id": "f898d99e-3505-4297-bb4c-e6197a0cb26f",
+  "event_type": "CustomerCalled",
+  "event_version": 1,
+  "occurred_at": "2026-10-03T09:02:00Z",
+  "producer": "queue-service",
+  "data": {"entry_id": 12, "queue_id": 1, "user_id": 42, "ticket_number": 43, "status": "CALLED",
+           "joined_at": "2026-10-03T08:40:00Z", "called_at": "2026-10-03T09:02:00Z", "served_at": null}
+}
+```
+
+`event_id` lets consumers deduplicate, and `event_version` lets the schema evolve.
+
+- **Producer settings:** `acks=all` and `enable.idempotence=true`; one producer per process; buffered messages are flushed on shutdown.
+- **Known limitation (dual write):** the database commit and the Kafka publish are two separate writes. If Kafka is unreachable, the API still succeeds and the event is lost after `message.timeout.ms`, with only an error in the log. This will be fixed by the **outbox pattern** (see Roadmap).
 
 ### API
 
@@ -89,13 +122,16 @@ Prerequisites: Docker. For local development you also need Python 3.12+.
 docker compose up --build
 ```
 
-This runs three containers in order:
+Containers, in start order:
 
 | Service | What it does |
 | ------- | ------------ |
 | `postgres` | PostgreSQL 17, published on host port **5433** |
+| `kafka` | Single-node Kafka 4.1 in KRaft mode (no ZooKeeper), published on host port **9094** |
+| `kafka-init` | One-shot job: creates topic `queue.events` (3 partitions), then exits |
 | `queue-migrate` | One-shot job: runs `alembic upgrade head`, then exits |
-| `queue-service` | The API on http://localhost:8000. It starts only after postgres is healthy **and** the migrations have finished successfully |
+| `queue-service` | The API on http://localhost:8000. It starts only after postgres is healthy **and** both one-shot jobs have succeeded |
+| `kafka-ui` | Optional web UI on http://localhost:8080, only with `docker compose --profile tools up` |
 
 Open http://localhost:8000/docs. Useful commands:
 
@@ -107,11 +143,21 @@ docker compose down                     # stop (keeps the data volume)
 docker compose down -v                  # stop and wipe the database
 ```
 
+Watch events live (key, partition and headers included):
+
+```bash
+docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 --topic queue.events --from-beginning \
+  --property print.key=true --property print.partition=true --property print.headers=true
+
+docker compose exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --describe --topic queue.events
+```
+
 ### Option B: run the service locally (fast reload while coding)
 
 ```bash
-# 1. Start only PostgreSQL
-docker compose up -d postgres
+# 1. Start PostgreSQL, Kafka and the topic job
+docker compose up -d postgres kafka kafka-init
 
 # 2. Create a virtualenv and install dependencies
 python -m venv .venv
@@ -138,8 +184,12 @@ passes `DATABASE_URL` directly.
 | Variable | Local (Option B) | Inside Docker (Option A) |
 | -------- | ---------------- | ------------------------ |
 | `DATABASE_URL` | `...@localhost:5433/queueless` | `...@postgres:5432/queueless` |
+| `KAFKA_BOOTSTRAP_SERVERS` | `localhost:9094` (default) | `kafka:9092` |
+| `QUEUE_EVENTS_TOPIC` | `queue.events` (default) | `queue.events` (default) |
 
-Inside the Compose network, containers reach each other by **service name** on the **container** port (`postgres:5432`).
+Inside the Compose network, containers reach each other by **service name** on the **container** port (`postgres:5432`, `kafka:9092`).
+Kafka needs two listeners for this because it tells clients which address to reconnect to (the *advertised* listener):
+containers are told `kafka:9092`, and your machine is told `localhost:9094`.
 `localhost:5433` only works from your machine, because `localhost` inside a container means that container itself.
 
 ### Tests
@@ -159,6 +209,9 @@ locking behaviour is checked manually against PostgreSQL. Partial indexes declar
 | ---- | ------ |
 | `tests/test_queue_flow.py` | join, duplicate join, 404s, call-next order, empty queue, called user can't rejoin |
 | `tests/test_entry_transitions.py` | serve, no-show, leave + rejoin, final states, invalid moves, ownership, cross-queue 404 |
+| `tests/test_events.py` | each action publishes the right event, key = queue id, order of a full lifecycle, failed actions publish nothing, unique event ids |
+
+Tests never touch Kafka: `conftest.py` overrides the `get_publisher` dependency with a `FakePublisher` that records events in a list.
 
 ### Manual concurrency checks (PostgreSQL)
 
@@ -194,6 +247,7 @@ queueless/
 │       ├── alembic.ini
 │       ├── app/
 │       │   ├── api/routes/     # HTTP routes
+│       │   ├── events/         # event envelope + Kafka publisher
 │       │   ├── models/         # SQLAlchemy models
 │       │   ├── schemas/        # Pydantic request/response schemas
 │       │   ├── services/       # business logic
@@ -213,7 +267,8 @@ queueless/
 - [x] Call next (row lock on the queue)
 - [x] Serve, no-show, leave (state machine + atomic compare-and-set)
 - [x] Dockerize the Queue Service (image, migration job, healthcheck)
-- [ ] Kafka: producers, consumers, topics, partitions, consumer groups
+- [x] Kafka: broker (KRaft), topic, producer, domain events from the Queue Service
+- [ ] Kafka: first consumer service (Notification), consumer groups, offsets
 - [ ] Delivery semantics, retries, dead-letter topics, idempotency
 - [ ] Outbox pattern, database per service, sagas
 - [ ] Event schemas and versioning

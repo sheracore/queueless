@@ -16,10 +16,52 @@ services:
       timeout: 5s
       retries: 5
 
+  kafka:
+    image: apache/kafka:4.1.0
+    container_name: queueless-kafka
+    ports:
+      - "9094:9094"
+    environment:
+      # KRaft: this one node is both the broker and the controller (no ZooKeeper).
+      CLUSTER_ID: "5L6g3nShT-eMCtK--X86sw"
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      # Three doors: containers use kafka:9092, your machine uses localhost:9094,
+      # 9093 is internal controller traffic.
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # Single node: internal topics can't have 3 replicas.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # Topics are created on purpose (kafka-init), never by a typo in a producer.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      start_period: 20s
+      retries: 10
+
+  kafka-init:
+    image: apache/kafka:4.1.0
+    entrypoint: ["/opt/kafka/bin/kafka-topics.sh"]
+    command: ["--bootstrap-server", "kafka:9092", "--create", "--if-not-exists",
+              "--topic", "queue.events", "--partitions", "3", "--replication-factor", "1"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: "no"
+
   queue-migrate:
     build: ./services/queue_service
     image: queueless/queue-service:dev
-    command: [ "alembic", "upgrade", "head" ]
+    command: ["alembic", "upgrade", "head"]
     environment:
       DATABASE_URL: postgresql+psycopg://queueless:queueless@postgres:5432/queueless
     depends_on:
@@ -32,6 +74,7 @@ services:
     container_name: queueless-queue-service
     environment:
       DATABASE_URL: postgresql+psycopg://queueless:queueless@postgres:5432/queueless
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
     ports:
       - "8000:8000"
     depends_on:
@@ -39,7 +82,22 @@ services:
         condition: service_healthy
       queue-migrate:
         condition: service_completed_successfully
+      kafka-init:
+        condition: service_completed_successfully
     restart: unless-stopped
+
+  kafka-ui:
+    image: kafbat/kafka-ui:latest
+    container_name: queueless-kafka-ui
+    profiles: ["tools"]   # only starts with: docker compose --profile tools up
+    environment:
+      KAFKA_CLUSTERS_0_NAME: queueless
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    ports:
+      - "8080:8080"
+    depends_on:
+      kafka:
+        condition: service_healthy
 
 volumes:
   postgres_data:
