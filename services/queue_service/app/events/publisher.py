@@ -1,3 +1,4 @@
+import threading
 import logging
 from functools import lru_cache
 from typing import Protocol
@@ -14,7 +15,7 @@ class EventPublisher(Protocol):
     # Anything with this method is a publisher: Kafka in production, a list in tests.
     def publish(self, topic: str, key: str, event: Event) -> None: ...
 
-    def flush(self, timeout: float = 10.0) -> int: ...
+    def close(self, timeout: float = 10.0) -> int: ...
 
 
 class KafkaEventPublisher:
@@ -25,7 +26,18 @@ class KafkaEventPublisher:
             "acks": "all",                 # wait until all in-sync replicas have the message
             "enable.idempotence": True,    # producer retries never create duplicates in the log
             "linger.ms": 5,                # wait up to 5 ms to batch messages together
+            "partitioner": "murmur2_random",  # same key -> same partition as Java clients
         })
+
+        # Delivery callbacks only run inside poll()/flush(). This thread calls poll()
+        # all the time, so success/failure is reported within ~0.5 s, not at the next request.
+        self._stop = threading.Event()
+        self._poller = threading.Thread(target=self._poll_loop, name="kafka-delivery-reports", daemon=True)
+        self._poller.start()
+
+    def _poll_loop(self) -> None:
+        while not self._stop.is_set():
+            self._producer.poll(0.5)
 
     def publish(self, topic: str, key: str, event: Event) -> None:
         # produce() is asynchronous: it only puts the message in a local buffer.
@@ -37,7 +49,6 @@ class KafkaEventPublisher:
             headers={"event_type": event.event_type.value},
             on_delivery=self._on_delivery,
         )
-        self._producer.poll(0)  # serve delivery callbacks of earlier messages, don't block
 
     @staticmethod
     def _on_delivery(err: KafkaError | None, msg: Message) -> None:
@@ -49,8 +60,11 @@ class KafkaEventPublisher:
                 msg.topic(), msg.partition(), msg.offset(),
             )
 
-    def flush(self, timeout: float = 10.0) -> int:
-        # Block until the buffer is sent; returns how many messages are still undelivered.
+    def close(self, timeout: float = 10.0) -> int:
+        # Stop the poll thread, then send what is still buffered.
+        # Returns how many messages are still undelivered (0 = all good).
+        self._stop.set()
+        self._poller.join()
         return self._producer.flush(timeout)
 
 

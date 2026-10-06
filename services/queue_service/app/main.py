@@ -14,7 +14,7 @@ async def lifespan(app: FastAPI):
     yield
     # Shutdown: send whatever is still in the producer's buffer, or it is lost.
     if get_publisher.cache_info().currsize:
-        get_publisher().flush()
+        get_publisher().close()
 
 
 app = FastAPI(

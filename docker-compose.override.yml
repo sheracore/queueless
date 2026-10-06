@@ -1,0 +1,29 @@
+# Development only. Docker Compose loads this file automatically on top of docker-compose.yml.
+# It mounts your source code into the containers and restarts the processes when a file changes.
+
+services:
+  queue-migrate:
+    volumes:
+      - ./services/queue_service/app:/app/app
+      - ./services/queue_service/migrations:/app/migrations
+
+  queue-service:
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload", "--reload-dir", "/app/app"]
+    volumes:
+      - ./services/queue_service/app:/app/app
+
+  notification-migrate:
+    volumes:
+      - ./services/notification_service/app:/app/app
+      - ./services/notification_service/migrations:/app/migrations
+
+  notification-worker:
+    # --sigint-timeout 30: give the consumer time to close cleanly before a restart (like stop_grace_period)
+    command: ["watchfiles", "--filter", "python", "--sigint-timeout", "30", "python -m app.worker", "/app/app"]
+    volumes:
+      - ./services/notification_service/app:/app/app
+
+  notification-api:
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload", "--reload-dir", "/app/app"]
+    volumes:
+      - ./services/notification_service/app:/app/app

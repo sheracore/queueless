@@ -37,3 +37,14 @@ def create_queue(
     db.refresh(queue)
 
     return queue
+
+@router.get(
+    "",
+    response_model=list[QueueResponse],
+)
+def list_queue(
+        business_id: int,
+        db: Session = Depends(get_db),
+):
+    queues = db.query(Queue).filter(Queue.business_id == business_id).all()
+    return queues

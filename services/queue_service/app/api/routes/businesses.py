@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
+from sqlalchemy import select
 
 from app.database import get_db
 from app.models.business import Business
@@ -29,3 +30,14 @@ def create_business(
     db.refresh(business)
 
     return business
+
+@router.get(
+    "",
+    response_model=list[BusinessResponse],
+)
+def list_business(
+        db: Session = Depends(get_db),
+):
+    result = db.execute(select(Business))
+    businesses = result.scalars().all()
+    return businesses
