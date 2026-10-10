@@ -87,7 +87,14 @@ def run() -> None:
                 continue
 
             # Commit only AFTER the work is done: at-least-once delivery.
-            consumer.commit(message=msg, asynchronous=False)
+            # Commit only AFTER the work is done: at-least-once delivery.
+            try:
+                consumer.commit(message=msg, asynchronous=False)
+            except KafkaException as exc:
+                # Normal during a rebalance: this partition may now belong to another worker
+                # (errors like ILLEGAL_GENERATION or REBALANCE_IN_PROGRESS). Not fatal: the
+                # event will be delivered again, and our handler ignores duplicates.
+                logger.warning("Commit failed, the event will be redelivered: %s", exc)
     except KafkaException as exc:
         logger.exception("Fatal Kafka error: %s", exc)
         raise

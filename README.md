@@ -7,7 +7,7 @@ and get notified when their turn approaches. Businesses create queues, call the 
 QueueLess is also a hands-on learning project: a real product used to learn **microservices, FastAPI and Kafka**
 step by step, one concept at a time.
 
-> **Status:** early development. Two services run in Docker: the **Queue Service** publishes domain events to Kafka, and the **Notification Service** consumes them. More consumers come next (see Roadmap).
+> **Status:** early development. Two services run in Docker: the **Queue Service** publishes domain events to Kafka through a **transactional outbox**, and the **Notification Service** consumes them. More consumers come next (see Roadmap).
 
 ## Architecture
 
@@ -40,10 +40,13 @@ queries such as "what is my position?" stay synchronous over HTTP.
 ## What exists today
 
 ```
-queue-service ──(CustomerJoinedQueue, CustomerCalled, ...)──▶ Kafka: queue.events ──▶ notification-worker ──▶ notifications DB ◀── notification-api
-      │                                                                              (consumer group                         (GET /users/{id}/notifications)
-      ▼                                                                               "notification-service")
-  queueless DB
+                 ┌──────────── queueless DB ─────────────┐
+queue-service ──▶│ queue_entries  +  outbox_events       │  (one transaction)
+   (API)         └───────────────────────┬───────────────┘
+                                         │ poll unpublished rows
+                                         ▼
+                              queue-outbox-relay ──▶ Kafka: queue.events ──▶ notification-worker ──▶ notifications DB ◀── notification-api
+                                                                             (group "notification-service")             (GET /users/{id}/notifications)
 ```
 
 Each service has **its own database** (database per service). They never read each other's tables; they communicate only through Kafka events.
@@ -75,7 +78,8 @@ The allowed moves are defined in one place, `ALLOWED_TRANSITIONS` in `app/servic
 
 ### Events (Kafka)
 
-Every successful state change publishes one event to the topic **`queue.events`** (3 partitions), **after** the database commit.
+Every successful state change produces one event on the topic **`queue.events`** (3 partitions). The API never talks to Kafka
+directly: it uses the **transactional outbox** pattern (next section).
 
 | Action | Event type |
 | ------ | ---------- |
@@ -103,9 +107,39 @@ Every successful state change publishes one event to the topic **`queue.events`*
 
 `event_id` lets consumers deduplicate, and `event_version` lets the schema evolve.
 
-- **Delivery reports:** a background thread calls `producer.poll()` continuously, so delivery success or failure is logged within ~0.5 s. Without it, callbacks only run when the *next* event is published.
-- **Producer settings:** `acks=all`, `enable.idempotence=true` (explicit, because librdkafka defaults it to false), and `partitioner=murmur2_random` (the same key → partition mapping as Java clients). One producer per process; buffered messages are flushed on shutdown.
-- **Known limitation (dual write):** the database commit and the Kafka publish are two separate writes. If Kafka is unreachable, the API still succeeds and the event is lost after `message.timeout.ms`, with only an error in the log. This will be fixed by the **outbox pattern** (see Roadmap).
+- **Producer settings (relay):** `acks=all`, `enable.idempotence=true` (explicit, because librdkafka defaults it to false), `partitioner=murmur2_random` (the same key → partition mapping as Java clients), and `message.timeout.ms=10000` (fail fast; the outbox row is simply retried).
+
+### Transactional outbox
+
+**Problem it solves (dual write):** saving to Postgres and sending to Kafka are two separate systems. If the process crashes between them,
+or Kafka is down, the change is saved but the event is lost, so a customer never gets "It's your turn!".
+
+**How it works:**
+
+1. The API writes the business change **and** a row in `outbox_events` in the **same transaction** (`QueueService._record_event`).
+   Both are saved, or neither. The API does not need Kafka at all: it keeps working when Kafka is down.
+2. `queue-outbox-relay` (`app/outbox_relay.py`, a separate process from the same image) repeatedly:
+   - reads up to 100 rows `WHERE published_at IS NULL ORDER BY id` with `FOR UPDATE SKIP LOCKED`,
+   - sends them to Kafka and waits for the acknowledgements,
+   - sets `published_at` only on the rows Kafka **confirmed**; failed rows stay pending and are retried.
+3. Published rows older than 7 days are deleted once per hour.
+
+**Guarantee: at-least-once.** If the relay crashes after Kafka confirmed a batch but before it marked the rows, the batch is sent again.
+That is safe because consumers are idempotent (the Notification Service stores each `event_id` once).
+
+**Ordering:** rows are sent in `id` order with the same key (`queue_id`), so each queue's events stay in order. Run **one** relay
+instance: two relays with `SKIP LOCKED` could send events of the same queue in parallel and change their order.
+
+| Table `outbox_events` | |
+| --------------------- | - |
+| `id` BIGINT | creation order; the relay sends in this order |
+| `event_id` UUID UNIQUE | same id as in the Kafka message |
+| `event_type`, `topic`, `message_key` | where and how to send |
+| `payload` JSONB | the full event envelope |
+| `created_at`, `published_at` | `published_at IS NULL` = waiting (partial index `ix_outbox_events_unpublished`) |
+
+**Alternative:** CDC (Change Data Capture) with Debezium reads the outbox table from the Postgres WAL instead of polling it.
+It has lower latency and no polling queries, but it needs Kafka Connect and more operations work.
 
 ### Notification Service
 
@@ -127,6 +161,7 @@ Events handled: `CustomerJoinedQueue` → "You joined the queue…", `CustomerCa
 - **`auto.offset.reset=earliest`**: a brand-new group starts from the oldest retained event, so nothing produced before the first deploy is missed.
 - **`partition.assignment.strategy=cooperative-sticky`**: incremental rebalancing. When a worker joins or leaves, only the partitions that must move are paused; the others keep working.
 - **Error handling**: an unparsable message (*poison message*) is logged and skipped. A database outage does **not** commit; the worker `seek()`s back to the same offset and retries every 5 s.
+- **Commit failures** during a rebalance (`ILLEGAL_GENERATION`, `REBALANCE_IN_PROGRESS`) are logged, not fatal: the event is redelivered and the handler ignores the duplicate.
 - **Graceful shutdown**: on SIGTERM the worker finishes the current message and calls `consumer.close()`, so its partitions move to other workers immediately.
 - **Contract, not code**: the worker validates events with its own Pydantic model (`app/events.py`) and does not import the queue service's code. Unknown extra fields are accepted, so the producer can add fields without breaking it.
 
@@ -165,7 +200,8 @@ Containers, in start order:
 | `kafka` | Single-node Kafka 4.1 in KRaft mode (no ZooKeeper), published on host port **9094** |
 | `kafka-init` | One-shot job: creates topic `queue.events` (3 partitions), then exits |
 | `queue-migrate` | One-shot job: runs `alembic upgrade head`, then exits |
-| `queue-service` | The API on http://localhost:8000. It starts only after postgres is healthy **and** both one-shot jobs have succeeded |
+| `queue-service` | The API on http://localhost:8000. It needs only Postgres (no Kafka), and starts after the migrations succeed |
+| `queue-outbox-relay` | Sends `outbox_events` rows to Kafka (same image, `python -m app.outbox_relay`; healthcheck disabled, no HTTP) |
 | `notification-postgres` | the Notification Service's own PostgreSQL 17, host port **5434** |
 | `notification-migrate` | One-shot job: Notification Service migrations |
 | `notification-worker` | Kafka consumer (no HTTP port; scale with `--scale notification-worker=N`) |
@@ -232,6 +268,7 @@ echo 'NOTIFICATION_DATABASE_URL=postgresql+psycopg://notification:notification@l
 cd services/queue_service
 alembic upgrade head
 uvicorn app.main:app --reload
+python -m app.outbox_relay          # in another terminal: sends the outbox to Kafka
 
 # 5. In other terminals: the Notification Service (migrate, worker, API)
 cd services/notification_service
@@ -253,7 +290,7 @@ passes `DATABASE_URL` directly.
 | -------- | ---------------- | ------------------------ |
 | `DATABASE_URL` | `...@localhost:5433/queueless` | `...@postgres:5432/queueless` |
 | `NOTIFICATION_DATABASE_URL` | `...@localhost:5434/notifications` | `...@notification-postgres:5432/notifications` |
-| `KAFKA_BOOTSTRAP_SERVERS` | `localhost:9094` (default) | `kafka:9092` |
+| `KAFKA_BOOTSTRAP_SERVERS` (relay, worker) | `localhost:9094` (default) | `kafka:9092` |
 | `CONSUMER_GROUP_ID` | `notification-service` (default) | `notification-service` (default) |
 | `QUEUE_EVENTS_TOPIC` | `queue.events` (default) | `queue.events` (default) |
 
@@ -279,7 +316,8 @@ locking behaviour is checked manually against PostgreSQL. Partial indexes declar
 | ---- | ------ |
 | `tests/test_queue_flow.py` | join, duplicate join, 404s, call-next order, empty queue, called user can't rejoin |
 | `tests/test_entry_transitions.py` | serve, no-show, leave + rejoin, final states, invalid moves, ownership, cross-queue 404 |
-| `tests/test_events.py` | each action publishes the right event, key = queue id, order of a full lifecycle, failed actions publish nothing, unique event ids |
+| `tests/test_events.py` | each action writes the right event to the outbox (same transaction), key = queue id, lifecycle order, failed actions write nothing, unique event ids |
+| `tests/test_outbox_relay.py` | relay sends pending rows in order and marks them, never resends published rows, failed rows stay pending and are retried, batch size, cleanup |
 
 | `services/notification_service/tests/test_handlers.py` | event → notification, duplicate event stored once, ignored event types, tolerant to new fields, invalid message rejected, read API |
 
@@ -327,12 +365,13 @@ queueless/
 │   │   ├── alembic.ini
 │   │   ├── app/
 │   │   │   ├── api/routes/     # HTTP routes
-│   │   │   ├── events/         # event envelope + Kafka publisher
-│   │   │   ├── models/         # SQLAlchemy models
+│   │   │   ├── events/         # event envelope + Kafka publisher (used by the relay)
+│   │   │   ├── models/         # SQLAlchemy models (incl. outbox_event.py)
 │   │   │   ├── schemas/        # Pydantic request/response schemas
 │   │   │   ├── services/       # business logic
 │   │   │   ├── config.py
 │   │   │   ├── database.py
+│   │   │   ├── outbox_relay.py # outbox -> Kafka relay process
 │   │   │   └── main.py
 │   │   ├── migrations/         # Alembic
 │   │   ├── tests/
@@ -364,10 +403,12 @@ queueless/
 - [x] Serve, no-show, leave (state machine + atomic compare-and-set)
 - [x] Dockerize the Queue Service (image, migration job, healthcheck)
 - [x] Kafka: broker (KRaft), topic, producer, domain events from the Queue Service
+- [x] Kafka fundamentals deep dive + lab (docs/kafka-fundamentals.md)
 - [x] Kafka: first consumer service (Notification), consumer groups, manual commits, idempotency, rebalancing
 - [x] Dev workflow: live code reload in Docker (compose override)
-- [ ] Delivery semantics, retries, dead-letter topics, idempotency
-- [ ] Outbox pattern, database per service, sagas
+- [x] Transactional outbox + relay (no lost events)
+- [ ] Retries and dead-letter topics
+- [ ] Sagas
 - [ ] Event schemas and versioning
 - [ ] Observability, testing, load testing, security
 - [ ] Kubernetes deployment and production architecture

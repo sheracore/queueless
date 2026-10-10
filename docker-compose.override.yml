@@ -12,6 +12,11 @@ services:
     volumes:
       - ./services/queue_service/app:/app/app
 
+  queue-outbox-relay:
+    command: [ "watchfiles", "--filter", "python", "--sigint-timeout", "30", "python -m app.outbox_relay", "/app/app" ]
+    volumes:
+      - ./services/queue_service/app:/app/app
+
   notification-migrate:
     volumes:
       - ./services/notification_service/app:/app/app

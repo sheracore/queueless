@@ -8,7 +8,7 @@ from app.config import settings
 from app.models.queue import Queue, QueueStatus
 from app.models.queue_entry import QueueEntry, QueueEntryStatus
 from app.events.envelope import EventType, entry_event
-from app.events.publisher import EventPublisher
+from app.models.outbox_event import OutboxEvent
 
 
 # The state machine of a ticket: current status -> statuses it may move to.
@@ -36,16 +36,19 @@ TRANSITION_EVENTS: dict[QueueEntryStatus, EventType] = {
 
 class QueueService:
 
-    def __init__(self, publisher: EventPublisher):
-        self.publisher = publisher
-
-    def _publish(self, event_type: EventType, entry: QueueEntry) -> None:
-        # Key = queue_id: all events of one queue land in the same partition, in order.
-        self.publisher.publish(
+    def _record_event(self, db: Session, event_type: EventType, entry: QueueEntry) -> None:
+        # Transactional outbox: we do NOT talk to Kafka here. We add the event to the
+        # outbox table in the SAME transaction as the state change. The next db.commit()
+        # saves both together, or neither. The outbox relay sends it to Kafka later.
+        event = entry_event(event_type, entry)
+        db.add(OutboxEvent(
+            event_id=event.event_id,
+            event_type=event.event_type.value,
             topic=settings.queue_events_topic,
-            key=str(entry.queue_id),
-            event=entry_event(event_type, entry),
-        )
+            message_key=str(entry.queue_id),  # key = queue_id: per-queue ordering on Kafka
+            payload=event.model_dump(mode="json"),
+            created_at=event.occurred_at,
+        ))
 
     def join_queue(
         self,
@@ -102,10 +105,11 @@ class QueueService:
         )
 
         db.add(entry)
-        db.commit() # Queue changes will be commited automatically
-        db.refresh(entry)
+        db.flush()  # sends the INSERT now (inside the transaction), so entry.id is known, flush() is NOT a commit.
 
-        self._publish(EventType.CUSTOMER_JOINED_QUEUE, entry)
+        self._record_event(db, EventType.CUSTOMER_JOINED_QUEUE, entry)
+        db.commit()  # ONE commit: queue counter + new entry + outbox event
+        db.refresh(entry)
         return entry
 
     def call_next(
@@ -141,10 +145,9 @@ class QueueService:
         entry.status = QueueEntryStatus.CALLED
         entry.called_at = datetime.now(timezone.utc)
 
+        self._record_event(db, EventType.CUSTOMER_CALLED, entry)
         db.commit()
         db.refresh(entry)
-
-        self._publish(EventType.CUSTOMER_CALLED, entry)
         return entry
 
     def _transition(
@@ -189,10 +192,9 @@ class QueueService:
                 detail=f"Cannot change entry from {QueueEntryStatus(current.status).name} to {target.name}",
             )
 
+        self._record_event(db, TRANSITION_EVENTS[target], entry)
         db.commit()
         db.refresh(entry)
-
-        self._publish(TRANSITION_EVENTS[target], entry)
         return entry
 
     def serve(self, db: Session, queue_id: int, entry_id: int) -> QueueEntry:

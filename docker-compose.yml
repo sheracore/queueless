@@ -74,7 +74,6 @@ services:
     container_name: queueless-queue-service
     environment:
       DATABASE_URL: postgresql+psycopg://queueless:queueless@postgres:5432/queueless
-      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
     ports:
       - "8000:8000"
     depends_on:
@@ -82,8 +81,22 @@ services:
         condition: service_healthy
       queue-migrate:
         condition: service_completed_successfully
+    restart: unless-stopped
+
+  queue-outbox-relay:
+    image: queueless/queue-service:dev
+    command: [ "python", "-m", "app.outbox_relay" ]
+    environment:
+      DATABASE_URL: postgresql+psycopg://queueless:queueless@postgres:5432/queueless
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    depends_on:
+      queue-migrate:
+        condition: service_completed_successfully
       kafka-init:
         condition: service_completed_successfully
+    healthcheck:
+      disable: true          # the image's HEALTHCHECK calls /health, but the relay has no HTTP server
+    stop_grace_period: 30s   # finish the current batch after SIGTERM
     restart: unless-stopped
 
   notification-postgres:

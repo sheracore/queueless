@@ -2,7 +2,6 @@ from fastapi import APIRouter, Depends, status
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.events.publisher import EventPublisher, get_publisher
 from app.schemas.queue_entry import QueueJoinRequest, QueueJoinResponse, QueueEntryResponse, QueueLeaveRequest
 from app.services.queue_service import QueueService
 
@@ -11,8 +10,8 @@ router = APIRouter(
     tags=["queue entries"]
 )
 
-def get_queue_service(publisher: EventPublisher = Depends(get_publisher)) -> QueueService:
-    return QueueService(publisher)
+def get_queue_service() -> QueueService:
+    return QueueService()
 
 
 @router.post(
