@@ -143,24 +143,60 @@ It has lower latency and no polling queries, but it needs Kafka Connect and more
 
 ### Notification Service
 
-`services/notification_service`: one image, run as three containers:
+`services/notification_service`: one image, run as four containers:
 
 | Container | Command | Role |
 | --------- | ------- | ---- |
 | `notification-migrate` | `alembic upgrade head` | one-shot migration job |
-| `notification-worker` | `python -m app.worker` | Kafka consumer: turns events into notifications (scalable) |
+| `notification-worker` | `python -m app.worker` | Kafka consumer of `queue.events`: turns events into SMS notifications (scalable) |
+| `notification-retry-worker` | `python -m app.worker --retry` | consumes the retry topics after their delay (group `notification-service-retry`) |
 | `notification-api` | `uvicorn app.main:app` | `GET /users/{user_id}/notifications` on http://localhost:8001 |
 
 Events handled: `CustomerJoinedQueue` → "You joined the queue…", `CustomerCalled` → "It's your turn!…". All other event types are ignored, but still committed.
+
+Each notification is sent as an SMS through `app/channels.py` (`FakeSmsProvider`, a stand-in for a real SMS API). Its row moves
+`PENDING` (saved) → `SENT` (provider accepted), and the `event_id` is passed to the provider as an idempotency key.
 
 **Consumer design:**
 
 - **Consumer group** `notification-service`: all worker instances share the 3 partitions of `queue.events`. Run more with `docker compose up -d --scale notification-worker=2`.
 - **`enable.auto.commit=false`**: the offset is committed only **after** the notification is saved (at-least-once).
-- **Idempotent handler**: `notifications.event_id` is UNIQUE. If Kafka delivers the same event twice (crash before commit, rebalance, manual replay), the second insert fails on the constraint and is ignored, so exactly one notification is stored per event.
+- **Idempotent handler**: `notifications.event_id` is UNIQUE, so there is at most one row per event. If the same event arrives again, a `SENT` row means "done, ignore", and a `PENDING` row means "the SMS failed before, try to send it again".
 - **`auto.offset.reset=earliest`**: a brand-new group starts from the oldest retained event, so nothing produced before the first deploy is missed.
 - **`partition.assignment.strategy=cooperative-sticky`**: incremental rebalancing. When a worker joins or leaves, only the partitions that must move are paused; the others keep working.
-- **Error handling**: an unparsable message (*poison message*) is logged and skipped. A database outage does **not** commit; the worker `seek()`s back to the same offset and retries every 5 s.
+- **Error handling** depends on the kind of error:
+
+  | Error | Example | What happens |
+  | ----- | ------- | ------------ |
+  | our own database is down | `OperationalError` | **blocking retry**: no commit, `seek()` back, try the same message again every 5 s (every message would fail anyway) |
+  | permanent | invalid JSON, unsupported `event_version` (`PermanentError`) | straight to the **DLQ** |
+  | anything else | SMS provider HTTP 503, a bug | **non-blocking retry**: park it in `retry-10s`, then `retry-60s`, then the **DLQ**; the partition keeps moving |
+
+### Retries and dead-letter topic (DLQ)
+
+```
+queue.events ──▶ notification-worker ──fail──▶ ...retry-10s ──▶ retry worker (after 10 s) ──fail──▶ ...retry-60s ──▶ retry worker (after 60 s) ──fail──▶ ...dlq
+                       │ success                                    │ success                                         │ success
+                       ▼                                            ▼                                                 ▼
+                     commit                                       commit                                            commit
+```
+
+- **Topics** (created by `kafka-init`): `queue.events.notification-service.retry-10s`, `.retry-60s` (3 partitions each) and `.dlq`
+  (1 partition, 30-day retention). The names include the consumer group, because retries belong to **this** consumer: other consumers
+  of `queue.events` are not affected.
+- **One topic per delay.** Every message in a tier waits the same time, so they become due in order and nothing waits behind a message with a longer delay.
+- **Headers** travel with the message: `x-attempt`, `x-retry-at-ms`, `x-original-topic/partition/offset`, `x-error`.
+- **Waiting without blocking:** the retry worker does not `sleep()`. If a message is not due, it **pauses** that partition, `seek()`s back
+  to it, and **resumes** the partition when the time comes. `poll()` keeps running, so the worker stays in the group.
+- **Safe hand-off:** the original offset is committed only after Kafka confirmed the copy in the retry topic or DLQ.
+- **Trade-off:** a retried event is processed **after** newer events of the same queue (ordering is lost for that event). That is fine for
+  notifications. A consumer that needs strict order must use blocking retries instead.
+- **Inspect and replay** (run in the worker container, e.g. `docker compose exec notification-worker python -m app.dlq list`):
+  - `python -m app.dlq list`: show every DLQ message with its error and original position (read-only).
+  - `python -m app.dlq replay`: send the DLQ messages that exist **now** to the first retry topic (fresh attempts). Messages that fail again
+    come back to the DLQ and are not replayed in the same run. Replay goes to this consumer's retry topic, never back to `queue.events`,
+    so other consumers do not see duplicates.
+- **Lab switch:** `SMS_FAILURE_RATE=0.5 docker compose up -d` makes the fake SMS provider fail 50% of the time.
 - **Commit failures** during a rebalance (`ILLEGAL_GENERATION`, `REBALANCE_IN_PROGRESS`) are logged, not fatal: the event is redelivered and the handler ignores the duplicate.
 - **Graceful shutdown**: on SIGTERM the worker finishes the current message and calls `consumer.close()`, so its partitions move to other workers immediately.
 - **Contract, not code**: the worker validates events with its own Pydantic model (`app/events.py`) and does not import the queue service's code. Unknown extra fields are accepted, so the producer can add fields without breaking it.
@@ -198,13 +234,14 @@ Containers, in start order:
 | ------- | ------------ |
 | `postgres` | PostgreSQL 17, published on host port **5433** |
 | `kafka` | Single-node Kafka 4.1 in KRaft mode (no ZooKeeper), published on host port **9094** |
-| `kafka-init` | One-shot job: creates topic `queue.events` (3 partitions), then exits |
+| `kafka-init` | One-shot job: creates `queue.events` (3 partitions) and the notification retry/DLQ topics, then exits |
 | `queue-migrate` | One-shot job: runs `alembic upgrade head`, then exits |
 | `queue-service` | The API on http://localhost:8000. It needs only Postgres (no Kafka), and starts after the migrations succeed |
 | `queue-outbox-relay` | Sends `outbox_events` rows to Kafka (same image, `python -m app.outbox_relay`; healthcheck disabled, no HTTP) |
 | `notification-postgres` | the Notification Service's own PostgreSQL 17, host port **5434** |
 | `notification-migrate` | One-shot job: Notification Service migrations |
 | `notification-worker` | Kafka consumer (no HTTP port; scale with `--scale notification-worker=N`) |
+| `notification-retry-worker` | consumer of the retry topics |
 | `notification-api` | Notification read API on http://localhost:8001 |
 | `kafka-ui` | Optional web UI on http://localhost:8080, only with `docker compose --profile tools up` |
 
@@ -319,7 +356,8 @@ locking behaviour is checked manually against PostgreSQL. Partial indexes declar
 | `tests/test_events.py` | each action writes the right event to the outbox (same transaction), key = queue id, lifecycle order, failed actions write nothing, unique event ids |
 | `tests/test_outbox_relay.py` | relay sends pending rows in order and marks them, never resends published rows, failed rows stay pending and are retried, batch size, cleanup |
 
-| `services/notification_service/tests/test_handlers.py` | event → notification, duplicate event stored once, ignored event types, tolerant to new fields, invalid message rejected, read API |
+| `services/notification_service/tests/test_handlers.py` | event → notification, duplicate event stored once, ignored event types, tolerant to new fields, invalid message rejected, read API, SMS sent once and marked SENT, provider failure keeps PENDING, retry after failure sends exactly once |
+| `services/notification_service/tests/test_retry.py` | topic names, retry tiers then DLQ, permanent errors straight to DLQ, failure headers (attempt, retry time, original position), fake provider failure rate |
 
 Run each service's tests from its own directory. Tests never touch Kafka: `conftest.py` overrides the `get_publisher` dependency with a `FakePublisher` that records events in a list.
 
@@ -386,8 +424,11 @@ queueless/
 │       │   ├── database.py
 │       │   ├── models.py           # Notification (UNIQUE event_id)
 │       │   ├── events.py           # consumer-side event contract (Pydantic)
-│       │   ├── handlers.py         # event -> notification (idempotent)
-│       │   ├── worker.py           # Kafka consumer loop
+│       │   ├── channels.py         # SMS sender (fake provider with a failure-rate lab switch)
+│       │   ├── handlers.py         # event -> notification -> SMS (idempotent, PENDING/SENT)
+│       │   ├── retry.py            # retry/DLQ topics, headers, FailureRouter
+│       │   ├── dlq.py              # CLI: list / replay the DLQ
+│       │   ├── worker.py           # Kafka consumer loop (main and --retry mode)
 │       │   └── main.py             # read API
 │       ├── migrations/
 │       ├── tests/
@@ -407,7 +448,7 @@ queueless/
 - [x] Kafka: first consumer service (Notification), consumer groups, manual commits, idempotency, rebalancing
 - [x] Dev workflow: live code reload in Docker (compose override)
 - [x] Transactional outbox + relay (no lost events)
-- [ ] Retries and dead-letter topics
+- [x] Retries and dead-letter topics (non-blocking retry tiers, DLQ, replay)
 - [ ] Sagas
 - [ ] Event schemas and versioning
 - [ ] Observability, testing, load testing, security
