@@ -28,6 +28,11 @@ services:
     volumes:
       - ./services/notification_service/app:/app/app
 
+  notification-retry-worker:
+    command: [ "watchfiles", "--filter", "python", "--sigint-timeout", "30", "python -m app.worker --retry", "/app/app" ]
+    volumes:
+      - ./services/notification_service/app:/app/app
+
   notification-api:
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload", "--reload-dir", "/app/app"]
     volumes:

@@ -1,10 +1,16 @@
 import uuid
 from datetime import datetime
+from enum import StrEnum
 
 from sqlalchemy import DateTime, String, Uuid
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
+
+
+class NotificationStatus(StrEnum):
+    PENDING = "PENDING"  # saved, but the SMS is not confirmed yet
+    SENT = "SENT"        # the SMS provider accepted it
 
 
 class Notification(Base):
@@ -21,3 +27,5 @@ class Notification(Base):
     ticket_number: Mapped[int] = mapped_column(nullable=False)
     message: Mapped[str] = mapped_column(String(500), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default=NotificationStatus.PENDING)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

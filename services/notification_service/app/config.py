@@ -17,6 +17,10 @@ class Settings(BaseSettings):
     kafka_bootstrap_servers: str = "localhost:9094"
     queue_events_topic: str = "queue.events"
     consumer_group_id: str = "notification-service"
+    # Retry tiers: a failed event waits 10 s, then 60 s, then goes to the dead-letter topic.
+    retry_delays_seconds: list[int] = [10, 60]
+    # LAB ONLY: probability (0.0 - 1.0) that the fake SMS provider fails. Simulates a flaky provider.
+    sms_failure_rate: float = 0.0
 
     model_config = SettingsConfigDict(
         env_file=find_env_file(),

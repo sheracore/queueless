@@ -10,6 +10,7 @@ from sqlalchemy.pool import StaticPool
 
 import app.models  # noqa: F401
 from app.database import Base, get_db
+from app.channels import SmsProviderError
 from app.main import app
 
 
@@ -20,6 +21,24 @@ def db():
     session = sessionmaker(bind=engine, autoflush=False)()
     yield session
     session.close()
+
+
+class RecordingSender:
+    """A fake SMS provider for tests: records every SMS, and can be told to fail."""
+
+    def __init__(self):
+        self.sent: list[tuple[int, str, str]] = []
+        self.fail = False
+
+    def send(self, user_id: int, text: str, idempotency_key: str) -> None:
+        if self.fail:
+            raise SmsProviderError("provider down (test)")
+        self.sent.append((user_id, text, idempotency_key))
+
+
+@pytest.fixture
+def sender():
+    return RecordingSender()
 
 
 @pytest.fixture

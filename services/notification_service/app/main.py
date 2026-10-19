@@ -17,7 +17,9 @@ class NotificationResponse(BaseModel):
     queue_id: int
     ticket_number: int
     message: str
+    status: str
     created_at: datetime
+    sent_at: datetime | None = None
 
     model_config = {"from_attributes": True}
 

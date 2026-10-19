@@ -50,9 +50,16 @@ services:
 
   kafka-init:
     image: apache/kafka:4.1.0
-    entrypoint: ["/opt/kafka/bin/kafka-topics.sh"]
-    command: ["--bootstrap-server", "kafka:9092", "--create", "--if-not-exists",
-              "--topic", "queue.events", "--partitions", "3", "--replication-factor", "1"]
+    entrypoint: [ "/bin/sh", "-c" ]
+    # $$ = a literal $ for the shell (a single $ would be replaced by Docker Compose itself).
+    command:
+      - |
+        set -e
+        CREATE="/opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --replication-factor 1"
+        $$CREATE --topic queue.events --partitions 3
+        $$CREATE --topic queue.events.notification-service.retry-10s --partitions 3
+        $$CREATE --topic queue.events.notification-service.retry-60s --partitions 3
+        $$CREATE --topic queue.events.notification-service.dlq --partitions 1 --config retention.ms=2592000000
     depends_on:
       kafka:
         condition: service_healthy
@@ -133,12 +140,28 @@ services:
     environment:
       NOTIFICATION_DATABASE_URL: postgresql+psycopg://notification:notification@notification-postgres:5432/notifications
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      SMS_FAILURE_RATE: ${SMS_FAILURE_RATE:-0}   # lab switch, e.g. SMS_FAILURE_RATE=0.5 docker compose up -d
     depends_on:
       notification-migrate:
         condition: service_completed_successfully
       kafka-init:
         condition: service_completed_successfully
     stop_grace_period: 30s   # time to finish the current message after SIGTERM
+    restart: unless-stopped
+
+  notification-retry-worker:
+    image: queueless/notification-service:dev
+    command: [ "python", "-m", "app.worker", "--retry" ]
+    environment:
+      NOTIFICATION_DATABASE_URL: postgresql+psycopg://notification:notification@notification-postgres:5432/notifications
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      SMS_FAILURE_RATE: ${SMS_FAILURE_RATE:-0}
+    depends_on:
+      notification-migrate:
+        condition: service_completed_successfully
+      kafka-init:
+        condition: service_completed_successfully
+    stop_grace_period: 30s
     restart: unless-stopped
 
   notification-api:
