@@ -15,6 +15,12 @@ logger = logging.getLogger(__name__)
 MESSAGES: dict[str, str] = {
     "CustomerJoinedQueue": "You joined the queue. Your ticket number is #{ticket_number}.",
     "CustomerCalled": "It's your turn! Ticket #{ticket_number}, please go to the counter.",
+    "TicketReservationCancelled": "Your reservation for ticket #{ticket_number} was cancelled: {reason}.",
+}
+# Turns the machine reason in the event into words for the customer.
+REASONS: dict[str, str] = {
+    "payment_declined": "the deposit payment was declined",
+    "payment_timeout": "the deposit was not paid in time",
 }
 
 
@@ -43,7 +49,10 @@ def handle_event(db: Session, event: IncomingEvent, sender: SmsSender) -> Notifi
             queue_id=event.data.queue_id,
             queue_entry_id=event.data.queue_entry_id,
             ticket_number=event.data.ticket_number,
-            message=template.format(ticket_number=event.data.ticket_number),
+            message=template.format(
+                ticket_number=event.data.ticket_number,
+                reason=REASONS.get(event.data.reason or "", "it could not be confirmed"),
+            ),
             created_at=datetime.now(timezone.utc),
             status=NotificationStatus.PENDING,
         )

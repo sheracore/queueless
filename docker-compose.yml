@@ -60,6 +60,7 @@ services:
         $$CREATE --topic queue.events.notification-service.retry-10s --partitions 3
         $$CREATE --topic queue.events.notification-service.retry-60s --partitions 3
         $$CREATE --topic queue.events.notification-service.dlq --partitions 1 --config retention.ms=2592000000
+        $$CREATE --topic payment.events --partitions 3
     depends_on:
       kafka:
         condition: service_healthy
@@ -104,6 +105,80 @@ services:
     healthcheck:
       disable: true          # the image's HEALTHCHECK calls /health, but the relay has no HTTP server
     stop_grace_period: 30s   # finish the current batch after SIGTERM
+    restart: unless-stopped
+
+  queue-saga-worker:
+    image: queueless/queue-service:dev
+    command: [ "python", "-m", "app.saga_worker" ]
+    environment:
+      DATABASE_URL: postgresql+psycopg://queueless:queueless@postgres:5432/queueless
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    depends_on:
+      queue-migrate:
+        condition: service_completed_successfully
+      kafka-init:
+        condition: service_completed_successfully
+    healthcheck:
+      disable: true          # no HTTP server in this process
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+  payment-postgres:
+    image: postgres:17
+    container_name: queueless-payment-postgres
+    environment:
+      POSTGRES_DB: payments
+      POSTGRES_USER: payment
+      POSTGRES_PASSWORD: payment
+    ports:
+      - "5435:5432"
+    volumes:
+      - payment_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U payment -d payments" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  payment-migrate:
+    build: ./services/payment_service
+    image: queueless/payment-service:dev
+    command: [ "alembic", "upgrade", "head" ]
+    environment:
+      PAYMENT_DATABASE_URL: postgresql+psycopg://payment:payment@payment-postgres:5432/payments
+    depends_on:
+      payment-postgres:
+        condition: service_healthy
+    restart: "no"
+
+  payment-worker:
+    image: queueless/payment-service:dev
+    command: [ "python", "-m", "app.worker" ]
+    environment:
+      PAYMENT_DATABASE_URL: postgresql+psycopg://payment:payment@payment-postgres:5432/payments
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      PAYMENT_DECLINE_RATE: ${PAYMENT_DECLINE_RATE:-0}   # lab switch: business "no"
+      PAYMENT_FAILURE_RATE: ${PAYMENT_FAILURE_RATE:-0}   # lab switch: technical failure
+    depends_on:
+      payment-migrate:
+        condition: service_completed_successfully
+      kafka-init:
+        condition: service_completed_successfully
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+  payment-outbox-relay:
+    image: queueless/payment-service:dev
+    command: [ "python", "-m", "app.outbox_relay" ]
+    environment:
+      PAYMENT_DATABASE_URL: postgresql+psycopg://payment:payment@payment-postgres:5432/payments
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    depends_on:
+      payment-migrate:
+        condition: service_completed_successfully
+      kafka-init:
+        condition: service_completed_successfully
+    stop_grace_period: 30s
     restart: unless-stopped
 
   notification-postgres:
@@ -199,3 +274,4 @@ services:
 volumes:
   postgres_data:
   notification_postgres_data:
+  payment_postgres_data:

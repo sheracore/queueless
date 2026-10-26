@@ -111,3 +111,10 @@ def test_retry_after_failure_sends_exactly_once(db, sender):
 
     assert handle_event(db, event, sender) is None   # a later duplicate: nothing sent
     assert len(sender.sent) == 1
+
+
+def test_cancelled_reservation_tells_the_customer_why(db, sender):
+    event = make_event("TicketReservationCancelled", user_id=42, ticket_number=7)
+    event.data.reason = "payment_declined"
+    n = handle_event(db, event, sender)
+    assert n.message == "Your reservation for ticket #7 was cancelled: the deposit payment was declined."

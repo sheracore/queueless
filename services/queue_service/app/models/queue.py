@@ -36,12 +36,16 @@ class Queue(Base):
         nullable=False,
         default=1,
     )
-
+    # Deposit to join, in the smallest currency unit (e.g. cents). 0 = free queue, no saga.
+    deposit_amount: Mapped[int] = mapped_column(
+        nullable=False,
+        default=0,
+        server_default="0",
+    )
     business = relationship(
         "Business",
         back_populates="queues",
     )
-
     entries = relationship(
         "QueueEntry",
         back_populates="queue",

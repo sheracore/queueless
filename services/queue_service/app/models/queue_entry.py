@@ -13,6 +13,8 @@ class QueueEntryStatus(IntEnum):
     SERVED = 3
     LEFT = 4
     NO_SHOW = 5
+    RESERVED = 6   # saga started: waiting for the deposit payment
+    CANCELLED = 7  # saga compensated: payment failed or timed out
 
 
 class QueueEntry(Base):
@@ -21,13 +23,13 @@ class QueueEntry(Base):
     __table_args__ = (
         # A ticket number is unique inside one queue.
         UniqueConstraint("queue_id", "ticket_number", name="uq_queue_entries_queue_ticket"),
-        # One ACTIVE entry (WAITING=1 / CALLED=2) per user per queue.
+        # One ACTIVE entry (WAITING=1 / CALLED=2 / RESERVED=6) per user per queue.
         Index(
             "uq_queue_entries_active_user",
             "queue_id", "user_id",
             unique=True,
-            postgresql_where=text("status IN (1, 2)"), # TODO: Change it while changing the DB
-            sqlite_where=text("status IN (1, 2)"), # for running tests # TODO: remove it while test migrate to Postgres
+            postgresql_where=text("status IN (1, 2, 6)"),
+            sqlite_where=text("status IN (1, 2, 6)"),
         ),
     )
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -61,6 +63,11 @@ class QueueEntry(Base):
     )
 
     served_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+    )
+
+    # Only for RESERVED entries: the saga deadline. After it, the reservation is cancelled.
+    reserved_until: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
     )
 

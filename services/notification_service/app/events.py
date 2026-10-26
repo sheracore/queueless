@@ -13,6 +13,7 @@ class QueueEntryData(BaseModel):
     user_id: int
     ticket_number: int
     status: str
+    reason: str | None = None  # only in TicketReservationCancelled
 
 
 class IncomingEvent(BaseModel):

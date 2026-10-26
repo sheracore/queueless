@@ -7,7 +7,7 @@ and get notified when their turn approaches. Businesses create queues, call the 
 QueueLess is also a hands-on learning project: a real product used to learn **microservices, FastAPI and Kafka**
 step by step, one concept at a time.
 
-> **Status:** early development. Two services run in Docker: the **Queue Service** publishes domain events to Kafka through a **transactional outbox**, and the **Notification Service** consumes them. More consumers come next (see Roadmap).
+> **Status:** early development. Three services run in Docker: the **Queue Service** publishes domain events through a **transactional outbox**, the **Notification Service** turns them into SMS, and the **Payment Service** takes deposits. Joining a deposit queue is a **saga** across the Queue and Payment services.
 
 ## Architecture
 
@@ -46,7 +46,13 @@ queue-service ──▶│ queue_entries  +  outbox_events       │  (one trans
                                          │ poll unpublished rows
                                          ▼
                               queue-outbox-relay ──▶ Kafka: queue.events ──▶ notification-worker ──▶ notifications DB ◀── notification-api
-                                                                             (group "notification-service")             (GET /users/{id}/notifications)
+                                                            │                (group "notification-service")             (GET /users/{id}/notifications)
+                                                            ▼
+                                     payment-worker ──▶ payments DB + outbox ──▶ payment-outbox-relay ──▶ Kafka: payment.events
+                                     (TicketReserved → charge,                                                      │
+                                      TicketReservationCancelled → refund)                                          ▼
+                                                                                      queue-saga-worker (PaymentSucceeded / PaymentFailed,
+                                                                                      reservation timeout) ──▶ queueless DB + outbox
 ```
 
 Each service has **its own database** (database per service). They never read each other's tables; they communicate only through Kafka events.
@@ -57,14 +63,18 @@ Each service has **its own database** (database per service). They never read ea
 
 - **Stack:** FastAPI, SQLAlchemy 2.x, Alembic, Pydantic v2 / pydantic-settings, PostgreSQL 17, Apache Kafka 4.1 (KRaft) with confluent-kafka, pytest, Docker / Docker Compose
 - **Domain:** `Business` 1-N `Queue` 1-N `QueueEntry`
-- **Queue entry states:** `WAITING(1)`, `CALLED(2)`, `SERVED(3)`, `LEFT(4)`, `NO_SHOW(5)`
+- **Queue entry states:** `WAITING(1)`, `CALLED(2)`, `SERVED(3)`, `LEFT(4)`, `NO_SHOW(5)`, `RESERVED(6)`, `CANCELLED(7)`
+- **Deposit queues:** a queue with `deposit_amount > 0` does not admit a customer directly: `join` creates a `RESERVED` ticket and starts the deposit saga (see below)
 - **Concurrency:** ticket numbers and "call next" run under a row lock (`SELECT ... FOR UPDATE`) on the queue row, so simultaneous requests are serialized
 - **State machine:** serve, no-show and leave are atomic compare-and-set updates (`UPDATE ... WHERE status IN (allowed) RETURNING`). If two actions race on one ticket, exactly one wins and the other gets `409`.
-- **Rules enforced in the database:** unique ticket number per queue; one active (WAITING/CALLED) entry per user per queue (a partial unique index, so a user can rejoin after leaving or being served)
+- **Rules enforced in the database:** unique ticket number per queue; one active (WAITING/CALLED/RESERVED) entry per user per queue (a partial unique index, so a user can rejoin after leaving or being served)
 
 ### Ticket lifecycle
 
 ```
+ deposit queue:
+ RESERVED ──payment ok──> WAITING        RESERVED ──payment failed / timeout──> CANCELLED
+
             call-next             serve
  WAITING ─────────────> CALLED ─────────> SERVED
     │                      │
@@ -73,7 +83,7 @@ Each service has **its own database** (database per service). They never read ea
   LEFT                  NO_SHOW
 ```
 
-`SERVED`, `LEFT` and `NO_SHOW` are final. Any other move returns `409`, for example `Cannot change entry from WAITING to SERVED`.
+`SERVED`, `LEFT`, `NO_SHOW` and `CANCELLED` are final. `RESERVED` moves only through the saga (never by HTTP). Any other move returns `409`, for example `Cannot change entry from WAITING to SERVED`.
 The allowed moves are defined in one place, `ALLOWED_TRANSITIONS` in `app/services/queue_service.py`.
 
 ### Events (Kafka)
@@ -88,6 +98,9 @@ directly: it uses the **transactional outbox** pattern (next section).
 | serve | `CustomerServed` |
 | no-show | `CustomerMarkedNoShow` |
 | leave | `CustomerLeftQueue` |
+| join a deposit queue | `TicketReserved` (with `deposit_amount`) |
+| payment ok (saga) | `CustomerJoinedQueue` |
+| payment failed or timeout (saga) | `TicketReservationCancelled` (with `reason`: `payment_declined` / `payment_timeout`) |
 
 - **Message key = `queue_id`.** All events of one queue go to the same partition, so consumers see them in order (joined → called → served). Different queues spread across partitions and are processed in parallel.
 - **One topic, many event types.** Kafka orders messages only within a partition, so events that must stay in order relative to each other (the same queue's) share a topic. The type is in the payload and in an `event_type` header.
@@ -172,6 +185,46 @@ Each notification is sent as an SMS through `app/channels.py` (`FakeSmsProvider`
   | permanent | invalid JSON, unsupported `event_version` (`PermanentError`) | straight to the **DLQ** |
   | anything else | SMS provider HTTP 503, a bug | **non-blocking retry**: park it in `retry-10s`, then `retry-60s`, then the **DLQ**; the partition keeps moving |
 
+### Payment Service
+
+`services/payment_service`: no HTTP API; one image, three containers (`payment-migrate`, `payment-worker`, `payment-outbox-relay`), own database `payments` (host port **5435**).
+
+- **Consumes** `queue.events` (group `payment-service`): `TicketReserved` → charge the deposit; `TicketReservationCancelled` → refund if it was charged. All other events are ignored.
+- **Publishes** to `payment.events` through its **own transactional outbox** (same pattern and relay code as the Queue Service): `PaymentSucceeded`, `PaymentFailed` (with `reason`), `PaymentRefunded`. Key = `queue_id`.
+- **Table `payments`:** UNIQUE `queue_entry_id` (one deposit per ticket); status `PENDING → SUCCEEDED | FAILED`, `SUCCEEDED → REFUNDED`.
+- **Idempotency:** the row is saved as `PENDING` *before* calling the gateway, and the gateway gets an idempotency key (`deposit-<entry id>`, `refund-<entry id>`). A retry never charges or refunds twice.
+- **Business "no" vs technical failure:** a declined card is a *result* (`PaymentFailed`, final). A gateway timeout is an *error*: the worker retries the same message (blocking retry).
+- **Blocking retries on purpose:** for one queue, `TicketReserved` must be handled before `TicketReservationCancelled`, otherwise a refund could be missed. Non-blocking retry topics would break that order.
+- **`FakePaymentGateway`** stands in for a real one. Lab switches: `PAYMENT_DECLINE_RATE` (business decline) and `PAYMENT_FAILURE_RATE` (technical failure).
+
+### Deposit saga (choreography)
+
+Joining a deposit queue touches two services and two databases, so it cannot be one transaction. It is a **saga**: a chain of
+local transactions, each publishing an event that triggers the next step, with a **compensating action** for every step that may need undoing.
+
+```
+Queue Service                          Kafka                       Payment Service
+─────────────                          ─────                       ───────────────
+join → ticket RESERVED  ──TicketReserved──▶ queue.events ──▶ charge deposit
+       + deadline (5 min)                                     ├─ approved ──PaymentSucceeded──┐
+                                                              └─ declined ──PaymentFailed─────┤
+queue-saga-worker ◀──────────────────────── payment.events ◀───────────────────────────────────┘
+  PaymentSucceeded → RESERVED → WAITING  (+ CustomerJoinedQueue)
+  PaymentFailed    → RESERVED → CANCELLED (+ TicketReservationCancelled)   ← compensation
+  deadline passed  → RESERVED → CANCELLED (+ TicketReservationCancelled)   ← timeout
+                                         queue.events ──▶ TicketReservationCancelled → refund if charged ← compensation
+```
+
+- **Choreography:** no central coordinator; each service reacts to the other's events. The Queue Service owns the saga's state
+  (`RESERVED` + `reserved_until`) and its timeout. (The alternative, **orchestration**, would have one component send commands such as
+  `ChargeDeposit` and wait for replies.)
+- **Every step is idempotent:** the Queue Service uses compare-and-set (`UPDATE … WHERE status = RESERVED`), so a duplicate or late
+  message finds the ticket in another status and changes nothing.
+- **Late payment after a timeout:** the ticket is already `CANCELLED`, so `PaymentSucceeded` is ignored; the Payment Service sees
+  `TicketReservationCancelled` and **refunds**. The end state is consistent: ticket `CANCELLED`, payment `REFUNDED`.
+- **Timeout:** `RESERVATION_TIMEOUT_SECONDS` (default 300). The saga worker checks every 5 s with `FOR UPDATE SKIP LOCKED`.
+- **Customer messages:** the Notification Service sends "You joined…" on `CustomerJoinedQueue` and "Your reservation … was cancelled: <reason>" on `TicketReservationCancelled`.
+
 ### Retries and dead-letter topic (DLQ)
 
 ```
@@ -234,10 +287,15 @@ Containers, in start order:
 | ------- | ------------ |
 | `postgres` | PostgreSQL 17, published on host port **5433** |
 | `kafka` | Single-node Kafka 4.1 in KRaft mode (no ZooKeeper), published on host port **9094** |
-| `kafka-init` | One-shot job: creates `queue.events` (3 partitions) and the notification retry/DLQ topics, then exits |
+| `kafka-init` | One-shot job: creates `queue.events`, `payment.events` (3 partitions each) and the notification retry/DLQ topics, then exits |
 | `queue-migrate` | One-shot job: runs `alembic upgrade head`, then exits |
 | `queue-service` | The API on http://localhost:8000. It needs only Postgres (no Kafka), and starts after the migrations succeed |
 | `queue-outbox-relay` | Sends `outbox_events` rows to Kafka (same image, `python -m app.outbox_relay`; healthcheck disabled, no HTTP) |
+| `queue-saga-worker` | Queue side of the deposit saga: consumes `payment.events`, expires reservations (`python -m app.saga_worker`) |
+| `payment-postgres` | the Payment Service's own PostgreSQL 17, host port **5435** |
+| `payment-migrate` | One-shot job: Payment Service migrations |
+| `payment-worker` | charges deposits and refunds them (consumes `queue.events`) |
+| `payment-outbox-relay` | sends the Payment Service's outbox to `payment.events` |
 | `notification-postgres` | the Notification Service's own PostgreSQL 17, host port **5434** |
 | `notification-migrate` | One-shot job: Notification Service migrations |
 | `notification-worker` | Kafka consumer (no HTTP port; scale with `--scale notification-worker=N`) |
@@ -256,6 +314,7 @@ docker compose down -v                  # stop and wipe the databases
 docker compose logs -f notification-worker              # see notifications being created
 docker compose up -d --scale notification-worker=2      # watch a rebalance in the logs
 curl localhost:8001/users/11/notifications
+PAYMENT_DECLINE_RATE=1 docker compose up -d payment-worker   # every deposit is declined (lab)
 ```
 
 Watch events live (key, partition and headers included):
@@ -300,18 +359,26 @@ pip install -r services/queue_service/requirements-dev.txt -r services/notificat
 # 3. Configure the environment: create .env in the repo root
 echo 'DATABASE_URL=postgresql+psycopg://queueless:queueless@localhost:5433/queueless' > .env
 echo 'NOTIFICATION_DATABASE_URL=postgresql+psycopg://notification:notification@localhost:5434/notifications' >> .env
+echo 'PAYMENT_DATABASE_URL=postgresql+psycopg://payment:payment@localhost:5435/payments' >> .env
 
 # 4. Apply migrations and run the service
 cd services/queue_service
 alembic upgrade head
 uvicorn app.main:app --reload
 python -m app.outbox_relay          # in another terminal: sends the outbox to Kafka
+python -m app.saga_worker           # in another terminal: the queue side of the deposit saga
 
 # 5. In other terminals: the Notification Service (migrate, worker, API)
 cd services/notification_service
 alembic upgrade head
 python -m app.worker
 uvicorn app.main:app --reload --port 8001
+
+# 6. In other terminals: the Payment Service (migrate, worker, relay)
+cd services/payment_service
+alembic upgrade head
+python -m app.worker
+python -m app.outbox_relay
 ```
 
 Don't run options A and B at the same time: they use the same ports.
@@ -327,6 +394,9 @@ passes `DATABASE_URL` directly.
 | -------- | ---------------- | ------------------------ |
 | `DATABASE_URL` | `...@localhost:5433/queueless` | `...@postgres:5432/queueless` |
 | `NOTIFICATION_DATABASE_URL` | `...@localhost:5434/notifications` | `...@notification-postgres:5432/notifications` |
+| `PAYMENT_DATABASE_URL` | `...@localhost:5435/payments` | `...@payment-postgres:5432/payments` |
+| `RESERVATION_TIMEOUT_SECONDS` (saga worker) | `300` (default) | `300` (default) |
+| `PAYMENT_DECLINE_RATE`, `PAYMENT_FAILURE_RATE` (payment worker, lab) | `0` | `${PAYMENT_DECLINE_RATE:-0}` from your shell |
 | `KAFKA_BOOTSTRAP_SERVERS` (relay, worker) | `localhost:9094` (default) | `kafka:9092` |
 | `CONSUMER_GROUP_ID` | `notification-service` (default) | `notification-service` (default) |
 | `QUEUE_EVENTS_TOPIC` | `queue.events` (default) | `queue.events` (default) |
@@ -357,6 +427,8 @@ locking behaviour is checked manually against PostgreSQL. Partial indexes declar
 | `tests/test_outbox_relay.py` | relay sends pending rows in order and marks them, never resends published rows, failed rows stay pending and are retried, batch size, cleanup |
 
 | `services/notification_service/tests/test_handlers.py` | event → notification, duplicate event stored once, ignored event types, tolerant to new fields, invalid message rejected, read API, SMS sent once and marked SENT, provider failure keeps PENDING, retry after failure sends exactly once |
+| `services/queue_service/tests/test_saga.py` | free queue joins directly, deposit queue reserves + `TicketReserved`, reserved user can't join twice or be called, payment ok confirms once, payment failed compensates, late success after cancel changes nothing, timeout cancels only overdue tickets |
+| `services/payment_service/tests/test_handlers.py` | approved → `PaymentSucceeded`, declined → `PaymentFailed`, duplicate event charges once, gateway outage keeps `PENDING` and the retry charges once, cancel after success refunds once, cancel after decline does not refund, other events ignored |
 | `services/notification_service/tests/test_retry.py` | topic names, retry tiers then DLQ, permanent errors straight to DLQ, failure headers (attempt, retry time, original position), fake provider failure rate |
 
 Run each service's tests from its own directory. Tests never touch Kafka: `conftest.py` overrides the `get_publisher` dependency with a `FakePublisher` that records events in a list.
@@ -410,8 +482,27 @@ queueless/
 │   │   │   ├── config.py
 │   │   │   ├── database.py
 │   │   │   ├── outbox_relay.py # outbox -> Kafka relay process
+│   │   │   ├── saga_worker.py  # deposit saga: payment results + reservation timeout
 │   │   │   └── main.py
 │   │   ├── migrations/         # Alembic
+│   │   ├── tests/
+│   │   └── pytest.ini
+│   ├── payment_service/
+│   │   ├── Dockerfile              # worker + relay, no HTTP
+│   │   ├── requirements.txt
+│   │   ├── alembic.ini
+│   │   ├── app/
+│   │   │   ├── config.py
+│   │   │   ├── database.py
+│   │   │   ├── models.py           # Payment (UNIQUE queue_entry_id), OutboxEvent
+│   │   │   ├── events/
+│   │   │   │   ├── contracts.py    # consumed queue.events contract + payment event builder
+│   │   │   │   └── publisher.py    # Kafka publisher for the relay
+│   │   │   ├── gateway.py          # FakePaymentGateway (idempotency keys, lab switches)
+│   │   │   ├── handlers.py         # charge_deposit, refund_if_charged
+│   │   │   ├── worker.py           # consumer of queue.events (blocking retries)
+│   │   │   └── outbox_relay.py     # outbox -> payment.events
+│   │   ├── migrations/
 │   │   ├── tests/
 │   │   └── pytest.ini
 │   └── notification_service/
@@ -449,7 +540,7 @@ queueless/
 - [x] Dev workflow: live code reload in Docker (compose override)
 - [x] Transactional outbox + relay (no lost events)
 - [x] Retries and dead-letter topics (non-blocking retry tiers, DLQ, replay)
-- [ ] Sagas
+- [x] Sagas: deposit saga (choreography, compensation, timeout, refund), Payment Service
 - [ ] Event schemas and versioning
 - [ ] Observability, testing, load testing, security
 - [ ] Kubernetes deployment and production architecture

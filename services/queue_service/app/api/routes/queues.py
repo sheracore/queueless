@@ -29,6 +29,7 @@ def create_queue(
         name=data.name,
         business_id=business_id,
         status=QueueStatus.OPEN,
+        deposit_amount=data.deposit_amount,
         created_at=datetime.now(timezone.utc),
     )
 

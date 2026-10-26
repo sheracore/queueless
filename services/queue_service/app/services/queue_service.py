@@ -1,7 +1,8 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 
 from fastapi import HTTPException
-from sqlalchemy import update
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -15,11 +16,14 @@ from app.models.outbox_event import OutboxEvent
 ALLOWED_TRANSITIONS: dict[QueueEntryStatus, set[QueueEntryStatus]] = {
     QueueEntryStatus.WAITING: {QueueEntryStatus.CALLED, QueueEntryStatus.LEFT},
     QueueEntryStatus.CALLED: {QueueEntryStatus.SERVED, QueueEntryStatus.NO_SHOW},
+# Deposit saga: RESERVED waits for the payment result.
+    QueueEntryStatus.RESERVED: {QueueEntryStatus.WAITING, QueueEntryStatus.CANCELLED},
+    QueueEntryStatus.CANCELLED: set(),
     QueueEntryStatus.SERVED: set(),
     QueueEntryStatus.LEFT: set(),
     QueueEntryStatus.NO_SHOW: set(),
 }
-
+ACTIVE_STATUSES = [QueueEntryStatus.WAITING, QueueEntryStatus.CALLED, QueueEntryStatus.RESERVED]
 
 def allowed_sources(target: QueueEntryStatus) -> list[QueueEntryStatus]:
     # The table inverted: "from which statuses can I reach `target`?"
@@ -36,11 +40,19 @@ TRANSITION_EVENTS: dict[QueueEntryStatus, EventType] = {
 
 class QueueService:
 
-    def _record_event(self, db: Session, event_type: EventType, entry: QueueEntry) -> None:
+    def _record_event(
+            self,
+            db: Session,
+            event_type: EventType,
+            entry: QueueEntry,
+            deposit_amount: Decimal | None = None,
+            reserved_until: datetime | None = None,
+            reason: str | None = None,
+    ) -> None:
         # Transactional outbox: we do NOT talk to Kafka here. We add the event to the
         # outbox table in the SAME transaction as the state change. The next db.commit()
         # saves both together, or neither. The outbox relay sends it to Kafka later.
-        event = entry_event(event_type, entry)
+        event = entry_event(event_type, entry, deposit_amount, reserved_until, reason)
         db.add(OutboxEvent(
             event_id=event.event_id,
             event_type=event.event_type.value,
@@ -81,7 +93,7 @@ class QueueService:
             .filter(
                 QueueEntry.queue_id == queue_id,
                 QueueEntry.user_id == user_id,
-                QueueEntry.status.in_([QueueEntryStatus.WAITING, QueueEntryStatus.CALLED]),
+                QueueEntry.status.in_(ACTIVE_STATUSES),
             )
             .first()
         )
@@ -96,18 +108,26 @@ class QueueService:
 
         queue.next_ticket_number += 1
 
+        now = datetime.now(timezone.utc)
+        needs_deposit = queue.deposit_amount > 0
         entry = QueueEntry(
             queue_id=queue_id,
             user_id=user_id,
             ticket_number=ticket_number,
-            status=QueueEntryStatus.WAITING,
-            joined_at=datetime.now(timezone.utc),
+            # A deposit queue does not admit the customer yet: it STARTS the saga.
+            status=QueueEntryStatus.RESERVED if needs_deposit else QueueEntryStatus.WAITING,
+            joined_at=now,
+            reserved_until=now + timedelta(seconds=settings.reservation_timeout_seconds) if needs_deposit else None,
         )
 
         db.add(entry)
-        db.flush()  # sends the INSERT now (inside the transaction), so entry.id is known, flush() is NOT a commit.
+        db.flush()
 
-        self._record_event(db, EventType.CUSTOMER_JOINED_QUEUE, entry)
+        if needs_deposit:
+            # Saga step 1. The Payment Service reacts to this event.
+            self._record_event(db, EventType.TICKET_RESERVED, entry, deposit_amount=queue.deposit_amount)
+        else:
+            self._record_event(db, EventType.CUSTOMER_JOINED_QUEUE, entry)
         db.commit()  # ONE commit: queue counter + new entry + outbox event
         db.refresh(entry)
         return entry
@@ -205,3 +225,56 @@ class QueueService:
 
     def leave(self, db: Session, queue_id: int, entry_id: int, user_id: int) -> QueueEntry:
         return self._transition(db, queue_id, entry_id, QueueEntryStatus.LEFT, user_id=user_id)
+
+    # ------------------------------------------------------------------
+    # Deposit saga: called by the saga worker, never by HTTP.
+    # Each method is idempotent: it uses compare-and-set, so a duplicate or late
+    # message finds the entry in another status and changes nothing.
+    # ------------------------------------------------------------------
+
+    def _move(self, db: Session, entry_id: int, target: QueueEntryStatus) -> QueueEntry | None:
+        return db.execute(
+            update(QueueEntry)
+            .where(QueueEntry.id == entry_id, QueueEntry.status.in_(allowed_sources(target)))
+            .values(status=target, reserved_until=None)
+            .returning(QueueEntry)
+        ).scalar_one_or_none()
+
+    def confirm_reservation(self, db: Session, entry_id: int) -> bool:
+        """Payment succeeded: RESERVED -> WAITING. The customer is now really in the queue."""
+        entry = self._move(db, entry_id, QueueEntryStatus.WAITING)
+        if entry is None:
+            db.rollback()  # not RESERVED any more (duplicate message, or already cancelled)
+            return False
+        self._record_event(db, EventType.CUSTOMER_JOINED_QUEUE, entry)
+        db.commit()
+        return True
+
+    def cancel_reservation(self, db: Session, entry_id: int, reason: str) -> bool:
+        """Compensation: RESERVED -> CANCELLED, and tell the other services why."""
+        entry = self._move(db, entry_id, QueueEntryStatus.CANCELLED)
+        if entry is None:
+            db.rollback()
+            return False
+        self._record_event(db, EventType.TICKET_RESERVATION_CANCELLED, entry, reason=reason)
+        db.commit()
+        return True
+
+    def expire_reservations(self, db: Session, now: datetime | None = None, limit: int = 100) -> int:
+        """Saga timeout: cancel RESERVED entries whose deadline has passed."""
+        now = now or datetime.now(timezone.utc)
+        expired_ids = db.scalars(
+            select(QueueEntry.id)
+            .where(QueueEntry.status == QueueEntryStatus.RESERVED, QueueEntry.reserved_until < now)
+            .order_by(QueueEntry.id)
+            .limit(limit)
+            .with_for_update(skip_locked=True)
+        ).all()
+        cancelled = 0
+        for entry_id in expired_ids:
+            entry = self._move(db, entry_id, QueueEntryStatus.CANCELLED)
+            if entry is not None:
+                self._record_event(db, EventType.TICKET_RESERVATION_CANCELLED, entry, reason="payment_timeout")
+                cancelled += 1
+        db.commit()
+        return cancelled

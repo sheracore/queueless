@@ -1,0 +1,6 @@
+  sqlalchemy
+  psycopg[binary]
+  alembic
+  pydantic-settings
+  confluent-kafka
+  watchfiles

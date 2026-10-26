@@ -19,6 +19,10 @@ class Settings(BaseSettings):
     database_url: str
     kafka_bootstrap_servers: str = "localhost:9094"
     queue_events_topic: str = "queue.events"
+    # Saga (deposit queues)
+    payment_events_topic: str = "payment.events"
+    saga_consumer_group_id: str = "queue-service-saga"
+    reservation_timeout_seconds: int = 20  # a RESERVED ticket waits at most 5 minutes for payment
 
     model_config = SettingsConfigDict(
         env_file=find_env_file(),

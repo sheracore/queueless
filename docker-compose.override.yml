@@ -37,3 +37,23 @@ services:
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload", "--reload-dir", "/app/app"]
     volumes:
       - ./services/notification_service/app:/app/app
+
+  queue-saga-worker:
+    command: [ "watchfiles", "--filter", "python", "--sigint-timeout", "30", "python -m app.saga_worker", "/app/app" ]
+    volumes:
+      - ./services/queue_service/app:/app/app
+
+  payment-migrate:
+    volumes:
+      - ./services/payment_service/app:/app/app
+      - ./services/payment_service/migrations:/app/migrations
+
+  payment-worker:
+    command: [ "watchfiles", "--filter", "python", "--sigint-timeout", "30", "python -m app.worker", "/app/app" ]
+    volumes:
+      - ./services/payment_service/app:/app/app
+
+  payment-outbox-relay:
+    command: [ "watchfiles", "--filter", "python", "--sigint-timeout", "30", "python -m app.outbox_relay", "/app/app" ]
+    volumes:
+      - ./services/payment_service/app:/app/app
