@@ -5,6 +5,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.events.catalog import EventType
 from app.events.contracts import IncomingEvent, payment_outbox_event
 from app.gateway import PaymentGateway
 from app.models import Payment, PaymentStatus
@@ -43,9 +44,9 @@ def charge_deposit(db: Session, event: IncomingEvent, gateway: PaymentGateway) -
     payment.failure_reason = result.reason
     payment.updated_at = datetime.now(timezone.utc)
     if result.approved:
-        db.add(payment_outbox_event("PaymentSucceeded", payment))
+        db.add(payment_outbox_event(EventType.PAYMENT_SUCCEEDED, payment))
     else:
-        db.add(payment_outbox_event("PaymentFailed", payment, reason=result.reason))
+        db.add(payment_outbox_event(EventType.PAYMENT_FAILED, payment, reason=result.reason))
     db.commit()   # ONE commit: new status + outbox event
     return payment.status
 
@@ -60,7 +61,7 @@ def refund_if_charged(db: Session, event: IncomingEvent, gateway: PaymentGateway
 
     payment.status = PaymentStatus.REFUNDED
     payment.updated_at = datetime.now(timezone.utc)
-    db.add(payment_outbox_event("PaymentRefunded", payment, reason=event.data.reason))
+    db.add(payment_outbox_event(EventType.PAYMENT_REFUNDED, payment, reason=event.data.reason))
     db.commit()
     return payment.status
 

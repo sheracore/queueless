@@ -1,5 +1,4 @@
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
 
 from fastapi import HTTPException
 from sqlalchemy import select, update
@@ -45,14 +44,13 @@ class QueueService:
             db: Session,
             event_type: EventType,
             entry: QueueEntry,
-            deposit_amount: Decimal | None = None,
-            reserved_until: datetime | None = None,
+            deposit_amount: int | None = None,
             reason: str | None = None,
     ) -> None:
         # Transactional outbox: we do NOT talk to Kafka here. We add the event to the
         # outbox table in the SAME transaction as the state change. The next db.commit()
         # saves both together, or neither. The outbox relay sends it to Kafka later.
-        event = entry_event(event_type, entry, deposit_amount, reserved_until, reason)
+        event = entry_event(event_type, entry, deposit_amount=deposit_amount, reason=reason)
         db.add(OutboxEvent(
             event_id=event.event_id,
             event_type=event.event_type.value,

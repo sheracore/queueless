@@ -7,7 +7,7 @@ and get notified when their turn approaches. Businesses create queues, call the 
 QueueLess is also a hands-on learning project: a real product used to learn **microservices, FastAPI and Kafka**
 step by step, one concept at a time.
 
-> **Status:** early development. Three services run in Docker: the **Queue Service** publishes domain events through a **transactional outbox**, the **Notification Service** turns them into SMS, and the **Payment Service** takes deposits. Joining a deposit queue is a **saga** across the Queue and Payment services.
+> **Status:** early development. Three services run in Docker: the **Queue Service** publishes domain events through a **transactional outbox**, the **Notification Service** turns them into SMS, and the **Payment Service** takes deposits. Joining a deposit queue is a **saga** across the Queue and Payment services. Every event has a versioned **JSON Schema contract**, checked in tests and in a **Schema Registry** before deployment.
 
 ## Architecture
 
@@ -104,7 +104,7 @@ directly: it uses the **transactional outbox** pattern (next section).
 
 - **Message key = `queue_id`.** All events of one queue go to the same partition, so consumers see them in order (joined → called → served). Different queues spread across partitions and are processed in parallel.
 - **One topic, many event types.** Kafka orders messages only within a partition, so events that must stay in order relative to each other (the same queue's) share a topic. The type is in the payload and in an `event_type` header.
-- **Envelope** (`app/events/envelope.py`):
+- **Envelope** (built by `app/events/envelope.py` from the typed models in `app/events/catalog.py`):
 
 ```json
 {
@@ -113,12 +113,13 @@ directly: it uses the **transactional outbox** pattern (next section).
   "event_version": 1,
   "occurred_at": "2026-10-03T09:02:00Z",
   "producer": "queue-service",
-  "data": {"entry_id": 12, "queue_id": 1, "user_id": 42, "ticket_number": 43, "status": "CALLED",
-           "joined_at": "2026-10-03T08:40:00Z", "called_at": "2026-10-03T09:02:00Z", "served_at": null}
+  "data": {"queue_entry_id": 12, "queue_id": 1, "user_id": 42, "ticket_number": 43, "status": "CALLED",
+           "joined_at": "2026-10-03T08:40:00Z", "called_at": "2026-10-03T09:02:00Z", "served_at": null,
+           "queue_name": "Dentist"}
 }
 ```
 
-`event_id` lets consumers deduplicate, and `event_version` lets the schema evolve.
+`event_id` lets consumers deduplicate, and `event_version` is the **major** version of the contract (see *Event schemas and versioning*).
 
 - **Producer settings (relay):** `acks=all`, `enable.idempotence=true` (explicit, because librdkafka defaults it to false), `partitioner=murmur2_random` (the same key → partition mapping as Java clients), and `message.timeout.ms=10000` (fail fast; the outbox row is simply retried).
 
@@ -254,6 +255,59 @@ queue.events ──▶ notification-worker ──fail──▶ ...retry-10s ─�
 - **Graceful shutdown**: on SIGTERM the worker finishes the current message and calls `consumer.close()`, so its partitions move to other workers immediately.
 - **Contract, not code**: the worker validates events with its own Pydantic model (`app/events.py`) and does not import the queue service's code. Unknown extra fields are accepted, so the producer can add fields without breaking it.
 
+### Event schemas and versioning
+
+```
+catalog.py (Pydantic, producer)  ──export──▶  contracts/<topic>/<Type>.schema.json  ──register──▶  Schema Registry :8081
+        │                                          │  + <Type>.example.json                          (BACKWARD per subject)
+        │ check (tests): files == models?          │                                                       │
+        ▼                                          ▼                                                       ▼
+ producer contract tests            consumer contract tests (payment, notification)        schema-register job gates the relays
+```
+
+- **One source of truth.** Each producer owns `app/events/catalog.py`: one Pydantic model per event type
+  (`queue.events`: 7 types, `payment.events`: 3 types). The outbox payload is `model.model_dump(mode="json")`, so a
+  message cannot leave the service in a shape the schema does not describe.
+- **Contracts are files.** `tools/schemas.py export` writes `contracts/<topic>/<Type>.schema.json` (JSON Schema
+  2020-12) and one example message per type. Consumers read these files, never the producer's code. See
+  [contracts/README.md](contracts/README.md).
+- **Closed producer, tolerant consumer.** Producer models use `extra="forbid"` (`additionalProperties: false`);
+  consumer models ignore unknown fields. With a closed schema, **adding an optional field is BACKWARD compatible**.
+- **Compatibility rules** (inside one `event_version`):
+
+  | Change | BACKWARD (our rule) |
+  | ------ | ------------------- |
+  | add an optional field | allowed |
+  | add a required field / remove or rename a field / change a type | **rejected** |
+
+  Breaking changes get `event_version: 2`, published next to version 1 until all consumers have moved.
+- **Subjects:** `<topic>-<EventType>` (TopicRecordNameStrategy), because one topic carries several event types,
+  for example `queue.events-TicketReserved`.
+- **Wire format stays plain JSON.** The registry is used as a **contract gate** (check at deploy time), not by the
+  serializer, so existing consumers and `kafka-console-consumer` keep working. The alternative (Confluent serializer
+  with a magic byte + schema id in each message) is described in [docs/event-schemas.md](docs/event-schemas.md).
+- **Deploy gate:** the one-shot `schema-register` job runs `tools/schemas.py register`. The outbox relays depend on
+  it (`service_completed_successfully`), so an incompatible schema stops the deployment before any event is published.
+- **Broken events go to a DLQ, not to the bin.** Consumers use `parse_or_ignore()` (`dead_letter.py`): a type they
+  do not handle is ignored, but **their own type that fails validation** (or an unsupported `event_version`, or
+  invalid JSON) is parked in a DLQ with `x-error` and `x-original-*` headers, and the offset is committed only after
+  Kafka confirmed the copy.
+
+  | Consumer | DLQ topic |
+  | -------- | --------- |
+  | payment-worker (`queue.events`) | `queue.events.payment-service.dlq` |
+  | queue-saga-worker (`payment.events`) | `payment.events.queue-service-saga.dlq` |
+
+Commands:
+
+```bash
+python tools/schemas.py export --service services/queue_service     # after changing catalog.py
+python tools/schemas.py check  --service services/queue_service     # exit 1 if contracts/ is out of date
+python tools/schemas.py compat   --registry http://localhost:8081
+python tools/schemas.py register --registry http://localhost:8081
+curl -s localhost:8081/subjects
+```
+
 ### API
 
 | Method | Path | Description |
@@ -287,7 +341,7 @@ Containers, in start order:
 | ------- | ------------ |
 | `postgres` | PostgreSQL 17, published on host port **5433** |
 | `kafka` | Single-node Kafka 4.1 in KRaft mode (no ZooKeeper), published on host port **9094** |
-| `kafka-init` | One-shot job: creates `queue.events`, `payment.events` (3 partitions each) and the notification retry/DLQ topics, then exits |
+| `kafka-init` | One-shot job: creates `queue.events`, `payment.events` (3 partitions each), the notification retry/DLQ topics and the payment / saga DLQs, then exits |
 | `queue-migrate` | One-shot job: runs `alembic upgrade head`, then exits |
 | `queue-service` | The API on http://localhost:8000. It needs only Postgres (no Kafka), and starts after the migrations succeed |
 | `queue-outbox-relay` | Sends `outbox_events` rows to Kafka (same image, `python -m app.outbox_relay`; healthcheck disabled, no HTTP) |
@@ -301,7 +355,9 @@ Containers, in start order:
 | `notification-worker` | Kafka consumer (no HTTP port; scale with `--scale notification-worker=N`) |
 | `notification-retry-worker` | consumer of the retry topics |
 | `notification-api` | Notification read API on http://localhost:8001 |
-| `kafka-ui` | Optional web UI on http://localhost:8080, only with `docker compose --profile tools up` |
+| `schema-registry` | Confluent Schema Registry on http://localhost:8081 (stores schemas in the `_schemas` topic, default compatibility BACKWARD) |
+| `schema-register` | One-shot job: checks and registers `contracts/` (`tools/schemas.py register`). The outbox relays wait for it to succeed |
+| `kafka-ui` | Optional web UI on http://localhost:8080 (shows the registry's schemas too), only with `docker compose --profile tools up` |
 
 Open http://localhost:8000/docs. Useful commands:
 
@@ -400,6 +456,8 @@ passes `DATABASE_URL` directly.
 | `KAFKA_BOOTSTRAP_SERVERS` (relay, worker) | `localhost:9094` (default) | `kafka:9092` |
 | `CONSUMER_GROUP_ID` | `notification-service` (default) | `notification-service` (default) |
 | `QUEUE_EVENTS_TOPIC` | `queue.events` (default) | `queue.events` (default) |
+| `DLQ_TOPIC` (payment worker) | `queue.events.payment-service.dlq` (default) | same |
+| `SAGA_DLQ_TOPIC` (queue saga worker) | `payment.events.queue-service-saga.dlq` (default) | same |
 
 Inside the Compose network, containers reach each other by **service name** on the **container** port (`postgres:5432`, `kafka:9092`).
 Kafka needs two listeners for this because it tells clients which address to reconnect to (the *advertised* listener):
@@ -413,7 +471,7 @@ cd services/queue_service
 python -m pytest -q
 ```
 
-Test dependencies (`pytest`, `httpx`) live in `requirements-dev.txt` and are not installed in the Docker image.
+Test dependencies (`pytest`, `httpx`, `fastjsonschema`) live in `requirements-dev.txt` and are not installed in the Docker image.
 
 Tests run against in-memory SQLite. SQLite ignores row locks, so they verify logic but not concurrency;
 locking behaviour is checked manually against PostgreSQL. Partial indexes declare both `postgresql_where` and
@@ -425,10 +483,14 @@ locking behaviour is checked manually against PostgreSQL. Partial indexes declar
 | `tests/test_entry_transitions.py` | serve, no-show, leave + rejoin, final states, invalid moves, ownership, cross-queue 404 |
 | `tests/test_events.py` | each action writes the right event to the outbox (same transaction), key = queue id, lifecycle order, failed actions write nothing, unique event ids |
 | `tests/test_outbox_relay.py` | relay sends pending rows in order and marks them, never resends published rows, failed rows stay pending and are retried, batch size, cleanup |
-
 | `services/notification_service/tests/test_handlers.py` | event → notification, duplicate event stored once, ignored event types, tolerant to new fields, invalid message rejected, read API, SMS sent once and marked SENT, provider failure keeps PENDING, retry after failure sends exactly once |
 | `services/queue_service/tests/test_saga.py` | free queue joins directly, deposit queue reserves + `TicketReserved`, reserved user can't join twice or be called, payment ok confirms once, payment failed compensates, late success after cancel changes nothing, timeout cancels only overdue tickets |
 | `services/payment_service/tests/test_handlers.py` | approved → `PaymentSucceeded`, declined → `PaymentFailed`, duplicate event charges once, gateway outage keeps `PENDING` and the retry charges once, cancel after success refunds once, cancel after decline does not refund, other events ignored |
+| `services/queue_service/tests/test_contracts.py` | contracts/ matches the catalog (drift), examples are valid, a full lifecycle (free + deposit queue, saga) produces all 7 types and every outbox payload validates, `payment.events` examples parse |
+| `services/queue_service/tests/test_saga_dead_letter.py` | saga worker: broken `PaymentSucceeded` is parked, other event types are ignored |
+| `services/payment_service/tests/test_contracts.py` | producer: drift, examples, real handler events cover all 3 types; consumer: every handled type exists in `contracts/queue.events` and its example is handled |
+| `services/payment_service/tests/test_dead_letter.py` | invalid JSON, wrong version, own type with a missing field → `PermanentError`; other types ignored; DLQ headers |
+| `services/notification_service/tests/test_contracts.py` | every type the worker sends a message for is published, every example yields a SENT notification |
 | `services/notification_service/tests/test_retry.py` | topic names, retry tiers then DLQ, permanent errors straight to DLQ, failure headers (attempt, retry time, original position), fake provider failure rate |
 
 Run each service's tests from its own directory. Tests never touch Kafka: `conftest.py` overrides the `get_publisher` dependency with a `FakePublisher` that records events in a list.
@@ -458,6 +520,7 @@ alembic upgrade head
 QueueLess is a learning project, so the concepts behind each step are written down:
 
 - [Kafka fundamentals](docs/kafka-fundamentals.md): log vs queue, KRaft architecture, brokers, partitions, segments, replication and ISR, topic configs and compaction, bootstrap servers and advertised listeners, producer internals, consumer groups, Kafka vs RabbitMQ, delivery guarantees, and a hands-on lab against this stack.
+- [Event schemas and versioning](docs/event-schemas.md): contracts, breaking vs non-breaking changes, BACKWARD/FORWARD/FULL, closed vs open JSON Schema, JSON Schema vs Avro vs Protobuf, Schema Registry subjects and naming strategies, wire format, dual publish for breaking changes, contract tests, and the step-by-step build of this part.
 
 ## Project structure
 
@@ -465,7 +528,10 @@ QueueLess is a learning project, so the concepts behind each step are written do
 queueless/
 ├── docker-compose.yml          # databases, kafka, one-shot jobs, both services
 ├── docker-compose.override.yml # dev only: code mounts + auto-reload (loaded automatically)
-├── docs/                       # learning notes (kafka-fundamentals.md, ...)
+├── docs/                       # learning notes (kafka-fundamentals.md, event-schemas.md)
+├── contracts/                  # GENERATED event contracts: <topic>/<Type>.schema.json + .example.json
+├── tools/
+│   └── schemas.py              # export / check / compat / register (Schema Registry)
 ├── services/
 │   ├── queue_service/
 │   │   ├── Dockerfile
@@ -475,7 +541,7 @@ queueless/
 │   │   ├── alembic.ini
 │   │   ├── app/
 │   │   │   ├── api/routes/     # HTTP routes
-│   │   │   ├── events/         # event envelope + Kafka publisher (used by the relay)
+│   │   │   ├── events/         # catalog.py (typed event models), envelope.py, dead_letter.py, Kafka publisher
 │   │   │   ├── models/         # SQLAlchemy models (incl. outbox_event.py)
 │   │   │   ├── schemas/        # Pydantic request/response schemas
 │   │   │   ├── services/       # business logic
@@ -490,12 +556,15 @@ queueless/
 │   ├── payment_service/
 │   │   ├── Dockerfile              # worker + relay, no HTTP
 │   │   ├── requirements.txt
+│   │   ├── requirements-dev.txt
 │   │   ├── alembic.ini
 │   │   ├── app/
 │   │   │   ├── config.py
 │   │   │   ├── database.py
+│   │   │   ├── dead_letter.py      # parse_or_ignore + DeadLetterPublisher
 │   │   │   ├── models.py           # Payment (UNIQUE queue_entry_id), OutboxEvent
 │   │   │   ├── events/
+│   │   │   │   ├── catalog.py      # typed payment.events models (source of the schemas)
 │   │   │   │   ├── contracts.py    # consumed queue.events contract + payment event builder
 │   │   │   │   └── publisher.py    # Kafka publisher for the relay
 │   │   │   ├── gateway.py          # FakePaymentGateway (idempotency keys, lab switches)
@@ -541,6 +610,7 @@ queueless/
 - [x] Transactional outbox + relay (no lost events)
 - [x] Retries and dead-letter topics (non-blocking retry tiers, DLQ, replay)
 - [x] Sagas: deposit saga (choreography, compensation, timeout, refund), Payment Service
-- [ ] Event schemas and versioning
+- [x] Event schemas and versioning (catalog, JSON Schema contracts, Schema Registry + BACKWARD, contract tests, consumer DLQs)
+- [ ] CI/CD: GitHub + Jenkins (tests, schema drift + registry compatibility checks, Docker image build and push)
 - [ ] Observability, testing, load testing, security
 - [ ] Kubernetes deployment and production architecture

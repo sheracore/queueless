@@ -1,0 +1,4 @@
+# services/payment_service/requirements-dev.txt
+-r requirements.txt
+pytest
+jsonschema

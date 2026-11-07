@@ -1,0 +1,18 @@
+{
+  "data": {
+    "called_at": null,
+    "joined_at": "2026-11-06T09:00:00Z",
+    "queue_entry_id": 12,
+    "queue_id": 3,
+    "queue_name": "Dentist",
+    "served_at": null,
+    "status": "WAITING",
+    "ticket_number": 7,
+    "user_id": 42
+  },
+  "event_id": "00000000-0000-0000-0000-000000000001",
+  "event_type": "CustomerJoinedQueue",
+  "event_version": 1,
+  "occurred_at": "2026-11-06T09:00:00Z",
+  "producer": "queue-service"
+}

@@ -1,10 +1,10 @@
+# services/payment_service/app/events/contracts.py
 import uuid
-from datetime import datetime, timezone
-from typing import Any
 
 from pydantic import BaseModel
 
 from app.config import settings
+from app.events.catalog import EVENT_MODELS, EventType
 from app.models import OutboxEvent, Payment
 
 
@@ -28,30 +28,27 @@ class IncomingEvent(BaseModel):
 
 # ---- what we PUBLISH to payment.events (through the outbox) ----
 
-def payment_outbox_event(event_type: str, payment: Payment, **extra: Any) -> OutboxEvent:
-    event_id = uuid.uuid4()
-    now = datetime.now(timezone.utc)
-    envelope = {
-        "event_id": str(event_id),
-        "event_type": event_type,
-        "event_version": 1,
-        "occurred_at": now.isoformat(),
-        "producer": "payment-service",
-        "data": {
-            "payment_id": payment.id,
-            "queue_entry_id": payment.queue_entry_id,
-            "queue_id": payment.queue_id,
-            "user_id": payment.user_id,
-            "amount": payment.amount,
-            "status": payment.status,
-            **extra,
-        },
+def payment_outbox_event(event_type: EventType, payment: Payment, reason: str | None = None) -> OutboxEvent:
+    """Build the typed event, then store it in the outbox. A payload that does not match
+    the catalog fails HERE, inside our transaction, never on a consumer."""
+    model = EVENT_MODELS[event_type]
+    data_model = model.model_fields["data"].annotation
+    data = {
+        "payment_id": payment.id,
+        "queue_entry_id": payment.queue_entry_id,
+        "queue_id": payment.queue_id,
+        "user_id": payment.user_id,
+        "amount": payment.amount,
+        "status": payment.status,
     }
+    if reason is not None:
+        data["reason"] = reason
+    event = model(data=data_model(**data))
     return OutboxEvent(
-        event_id=event_id,
-        event_type=event_type,
+        event_id=event.event_id,
+        event_type=event.event_type.value,
         topic=settings.payment_events_topic,
         message_key=str(payment.queue_id),  # same key as queue.events: per-queue ordering
-        payload=envelope,
-        created_at=now,
+        payload=event.model_dump(mode="json"),
+        created_at=event.occurred_at,
     )

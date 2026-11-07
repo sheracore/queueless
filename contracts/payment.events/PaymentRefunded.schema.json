@@ -1,0 +1,107 @@
+{
+  "$defs": {
+    "PaymentRefundedData": {
+      "additionalProperties": false,
+      "properties": {
+        "amount": {
+          "description": "Smallest currency unit.",
+          "minimum": 0,
+          "title": "Amount",
+          "type": "integer"
+        },
+        "payment_id": {
+          "title": "Payment Id",
+          "type": "integer"
+        },
+        "queue_entry_id": {
+          "title": "Queue Entry Id",
+          "type": "integer"
+        },
+        "queue_id": {
+          "title": "Queue Id",
+          "type": "integer"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reason"
+        },
+        "status": {
+          "enum": [
+            "SUCCEEDED",
+            "FAILED",
+            "REFUNDED"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "user_id": {
+          "title": "User Id",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "payment_id",
+        "queue_entry_id",
+        "queue_id",
+        "user_id",
+        "amount",
+        "status"
+      ],
+      "title": "PaymentRefundedData",
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "data": {
+      "$ref": "#/$defs/PaymentRefundedData"
+    },
+    "event_id": {
+      "format": "uuid",
+      "title": "Event Id",
+      "type": "string"
+    },
+    "event_type": {
+      "const": "PaymentRefunded",
+      "default": "PaymentRefunded",
+      "title": "Event Type",
+      "type": "string"
+    },
+    "event_version": {
+      "const": 1,
+      "default": 1,
+      "title": "Event Version",
+      "type": "integer"
+    },
+    "occurred_at": {
+      "format": "date-time",
+      "title": "Occurred At",
+      "type": "string"
+    },
+    "producer": {
+      "const": "payment-service",
+      "default": "payment-service",
+      "title": "Producer",
+      "type": "string"
+    }
+  },
+  "required": [
+    "data",
+    "event_id",
+    "event_type",
+    "event_version",
+    "occurred_at",
+    "producer"
+  ],
+  "title": "PaymentRefunded",
+  "type": "object"
+}

@@ -1,0 +1,16 @@
+{
+  "data": {
+    "amount": 50000,
+    "payment_id": 5,
+    "queue_entry_id": 12,
+    "queue_id": 3,
+    "reason": "card_declined",
+    "status": "FAILED",
+    "user_id": 42
+  },
+  "event_id": "00000000-0000-0000-0000-000000000066",
+  "event_type": "PaymentFailed",
+  "event_version": 1,
+  "occurred_at": "2026-11-06T09:00:00Z",
+  "producer": "payment-service"
+}

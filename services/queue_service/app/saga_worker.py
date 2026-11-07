@@ -1,3 +1,4 @@
+# services/queue_service/app/saga_worker.py
 """Queue Service side of the deposit saga.
 
     python -m app.saga_worker
@@ -12,18 +13,21 @@ import socket
 import time
 
 from confluent_kafka import Consumer, KafkaException, Message, TopicPartition
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.database import SessionLocal
+from app.events.dead_letter import DeadLetterPublisher, PermanentError, parse_or_ignore
 from app.services.queue_service import QueueService
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("queue.saga_worker")
 
 EXPIRE_EVERY_SECONDS = 5
+SAGA_EVENT_TYPES = {"PaymentSucceeded", "PaymentFailed"}   # the ones that move a reservation
+SUPPORTED_EVENT_VERSIONS = {1}
 
 running = True
 
@@ -84,6 +88,7 @@ def run() -> None:
     service = QueueService()
     consumer = create_consumer()
     consumer.subscribe([settings.payment_events_topic])
+    dlq = DeadLetterPublisher(settings.kafka_bootstrap_servers, settings.saga_dlq_topic)
     logger.info("Saga worker: consuming %s, reservation timeout %ss",
                 settings.payment_events_topic, settings.reservation_timeout_seconds)
     last_expire = 0.0
@@ -110,10 +115,16 @@ def run() -> None:
                 continue
 
             try:
-                event = PaymentEvent.model_validate_json(msg.value())
-            except ValidationError as exc:
-                logger.error("Skipping invalid payment event at offset %s: %s", msg.offset(), exc)
-            else:
+                event = parse_or_ignore(msg.value(), SAGA_EVENT_TYPES, PaymentEvent, SUPPORTED_EVENT_VERSIONS)
+            except PermanentError as exc:
+                try:
+                    dlq.send(msg, exc)
+                except Exception as send_exc:
+                    retry_same_message(consumer, msg, send_exc)
+                    continue
+                logger.error("Offset %s parked in %s: %s", msg.offset(), dlq.topic, exc)
+                event = None
+            if event is not None:
                 try:
                     with SessionLocal() as db:
                         result = handle_payment_event(db, service, event)

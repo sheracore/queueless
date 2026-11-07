@@ -61,6 +61,8 @@ services:
         $$CREATE --topic queue.events.notification-service.retry-60s --partitions 3
         $$CREATE --topic queue.events.notification-service.dlq --partitions 1 --config retention.ms=2592000000
         $$CREATE --topic payment.events --partitions 3
+        $$CREATE --topic queue.events.payment-service.dlq --partitions 1 --config retention.ms=2592000000
+        $$CREATE --topic payment.events.queue-service-saga.dlq --partitions 1 --config retention.ms=2592000000
     depends_on:
       kafka:
         condition: service_healthy
@@ -101,6 +103,8 @@ services:
       queue-migrate:
         condition: service_completed_successfully
       kafka-init:
+        condition: service_completed_successfully
+      schema-register:       # deploy gate: no publishing with an incompatible schema
         condition: service_completed_successfully
     healthcheck:
       disable: true          # the image's HEALTHCHECK calls /health, but the relay has no HTTP server
@@ -177,6 +181,8 @@ services:
       payment-migrate:
         condition: service_completed_successfully
       kafka-init:
+        condition: service_completed_successfully
+      schema-register:       # deploy gate: no publishing with an incompatible schema
         condition: service_completed_successfully
     stop_grace_period: 30s
     restart: unless-stopped
@@ -258,6 +264,41 @@ services:
       retries: 3
     restart: unless-stopped
 
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.9.0
+    container_name: queueless-schema-registry
+    ports:
+      - "8081:8081"
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: PLAINTEXT://kafka:9092
+      # The registry stores every schema in a Kafka topic (_schemas). Its default
+      # replication factor is 3, which a single broker cannot provide.
+      SCHEMA_REGISTRY_KAFKASTORE_TOPIC_REPLICATION_FACTOR: 1
+      SCHEMA_REGISTRY_SCHEMA_COMPATIBILITY_LEVEL: backward
+    depends_on:
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -fsS http://localhost:8081/subjects > /dev/null" ]
+      interval: 10s
+      timeout: 5s
+      start_period: 20s
+      retries: 10
+    restart: unless-stopped
+
+  schema-register:
+    image: python:3.13-slim
+    command: [ "python", "/repo/tools/schemas.py", "register", "--registry", "http://schema-registry:8081" ]
+    volumes:
+      - ./tools:/repo/tools:ro
+      - ./contracts:/repo/contracts:ro
+    depends_on:
+      schema-registry:
+        condition: service_healthy
+    restart: "no"
+
   kafka-ui:
     image: kafbat/kafka-ui:latest
     container_name: queueless-kafka-ui
@@ -265,6 +306,7 @@ services:
     environment:
       KAFKA_CLUSTERS_0_NAME: queueless
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_SCHEMAREGISTRY: http://schema-registry:8081
     ports:
       - "8080:8080"
     depends_on:

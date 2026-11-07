@@ -1,0 +1,136 @@
+{
+  "$defs": {
+    "TicketReservationCancelledData": {
+      "additionalProperties": false,
+      "properties": {
+        "called_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Called At"
+        },
+        "joined_at": {
+          "format": "date-time",
+          "title": "Joined At",
+          "type": "string"
+        },
+        "queue_entry_id": {
+          "title": "Queue Entry Id",
+          "type": "integer"
+        },
+        "queue_id": {
+          "title": "Queue Id",
+          "type": "integer"
+        },
+        "queue_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Queue Name"
+        },
+        "reason": {
+          "enum": [
+            "payment_declined",
+            "payment_timeout"
+          ],
+          "title": "Reason",
+          "type": "string"
+        },
+        "served_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Served At"
+        },
+        "status": {
+          "title": "Status",
+          "type": "string"
+        },
+        "ticket_number": {
+          "title": "Ticket Number",
+          "type": "integer"
+        },
+        "user_id": {
+          "title": "User Id",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "queue_entry_id",
+        "queue_id",
+        "user_id",
+        "ticket_number",
+        "status",
+        "joined_at",
+        "reason"
+      ],
+      "title": "TicketReservationCancelledData",
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "data": {
+      "$ref": "#/$defs/TicketReservationCancelledData"
+    },
+    "event_id": {
+      "format": "uuid",
+      "title": "Event Id",
+      "type": "string"
+    },
+    "event_type": {
+      "const": "TicketReservationCancelled",
+      "default": "TicketReservationCancelled",
+      "title": "Event Type",
+      "type": "string"
+    },
+    "event_version": {
+      "const": 1,
+      "default": 1,
+      "title": "Event Version",
+      "type": "integer"
+    },
+    "occurred_at": {
+      "format": "date-time",
+      "title": "Occurred At",
+      "type": "string"
+    },
+    "producer": {
+      "const": "queue-service",
+      "default": "queue-service",
+      "title": "Producer",
+      "type": "string"
+    }
+  },
+  "required": [
+    "data",
+    "event_id",
+    "event_type",
+    "event_version",
+    "occurred_at",
+    "producer"
+  ],
+  "title": "TicketReservationCancelled",
+  "type": "object"
+}

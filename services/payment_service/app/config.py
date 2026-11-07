@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     payment_database_url: str
     kafka_bootstrap_servers: str = "localhost:9094"
     queue_events_topic: str = "queue.events"       # we consume it
+    dlq_topic: str = "queue.events.payment-service.dlq"  # our events we can never process
     payment_events_topic: str = "payment.events"   # we publish to it (via the outbox)
     consumer_group_id: str = "payment-service"
     # LAB ONLY: the fake payment gateway.

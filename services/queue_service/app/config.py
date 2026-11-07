@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     queue_events_topic: str = "queue.events"
     # Saga (deposit queues)
     payment_events_topic: str = "payment.events"
+    saga_dlq_topic: str = "payment.events.queue-service-saga.dlq"
     saga_consumer_group_id: str = "queue-service-saga"
     reservation_timeout_seconds: int = 20  # a RESERVED ticket waits at most 5 minutes for payment
 
