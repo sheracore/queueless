@@ -520,7 +520,7 @@ alembic upgrade head
 QueueLess is a learning project, so the concepts behind each step are written down:
 
 - [Kafka fundamentals](docs/kafka-fundamentals.md): log vs queue, KRaft architecture, brokers, partitions, segments, replication and ISR, topic configs and compaction, bootstrap servers and advertised listeners, producer internals, consumer groups, Kafka vs RabbitMQ, delivery guarantees, and a hands-on lab against this stack.
-- [Event schemas and versioning](docs/event-schemas.md): contracts, breaking vs non-breaking changes, BACKWARD/FORWARD/FULL, closed vs open JSON Schema, JSON Schema vs Avro vs Protobuf, Schema Registry subjects and naming strategies, wire format, dual publish for breaking changes, contract tests, and the step-by-step build of this part.
+- is a later option: contracts, breaking vs non-breaking changes, BACKWARD/FORWARD/FULL, closed vs open JSON Schema, JSON Schema vs Avro vs Protobuf, Schema Registry subjects and naming strategies, wire format, dual publish for breaking changes, contract tests, and the step-by-step build of this part.
 
 ## Project structure
 

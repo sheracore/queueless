@@ -71,7 +71,7 @@
         "queue_entry_id",
         "queue_id",
         "user_id",
-        "ticket",
+        "ticket_number",
         "status",
         "joined_at"
       ],
