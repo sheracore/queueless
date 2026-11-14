@@ -611,6 +611,6 @@ queueless/
 - [x] Retries and dead-letter topics (non-blocking retry tiers, DLQ, replay)
 - [x] Sagas: deposit saga (choreography, compensation, timeout, refund), Payment Service
 - [x] Event schemas and versioning (catalog, JSON Schema contracts, Schema Registry + BACKWARD, contract tests, consumer DLQs)
-- [ ] CI/CD: GitHub + Jenkins (tests, schema drift + registry compatibility checks, Docker image build and push)
+- [ ] CI/CD: GitHub Actions (tests, schema drift + registry compatibility checks, Docker image build and push)
 - [ ] Observability, testing, load testing, security
 - [ ] Kubernetes deployment and production architecture
